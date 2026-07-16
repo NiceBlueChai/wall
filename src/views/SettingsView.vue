@@ -217,13 +217,17 @@ function readError(error: unknown): string {
                 </div>
             </div>
             <p>本地视频与图片动态壁纸工具</p>
+            <dl class="about-contact">
+                <dt>作者：</dt>
+                <dd>NiceBlueChai</dd>
+                <dt>联系邮箱：</dt>
+                <dd>bluechai@qq.com</dd>
+            </dl>
             <div class="button-row">
                 <button class="secondary button-medium" @click="run(openLicense)">查看开源许可证</button
-                ><button class="secondary button-medium" disabled @click="run(openProjectHomepage)">
-                    打开项目主页
-                </button>
+                ><button class="secondary button-medium" @click="run(openProjectHomepage)">打开项目主页</button>
             </div>
-            <small class="offline-notice">项目主页尚未配置；Wall 自身不请求网络。</small>
+            <small class="offline-notice">点击后使用系统默认浏览器打开；Wall 自身不请求网络。</small>
         </div>
         <p v-if="errorMessage" class="inline-error">{{ errorMessage }}</p>
     </section>

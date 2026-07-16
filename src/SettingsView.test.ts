@@ -7,12 +7,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wallStore, defaultSettings } from './store';
 import SettingsView from './views/SettingsView.vue';
 
-const mocks = vi.hoisted(() => ({ openLicense: vi.fn(), updateSettings: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+    openLicense: vi.fn(),
+    openProjectHomepage: vi.fn(),
+    updateSettings: vi.fn(),
+}));
 
 vi.mock('./api', () => ({
     updateSettings: mocks.updateSettings,
     openLicense: mocks.openLicense,
-    openProjectHomepage: vi.fn(),
+    openProjectHomepage: mocks.openProjectHomepage,
 }));
 
 describe('SettingsView', () => {
@@ -54,8 +58,19 @@ describe('SettingsView', () => {
         expect(wrapper.text()).toContain('v1.0.0');
         expect(wrapper.text()).toContain('完全离线');
         expect(wrapper.get('.about-brand img').attributes('width')).toBe('48');
+        expect(wrapper.findAll('.about-contact dt').map((node) => node.text())).toEqual(['作者：', '联系邮箱：']);
+        expect(wrapper.findAll('.about-contact dd').map((node) => node.text())).toEqual([
+            'NiceBlueChai',
+            'bluechai@qq.com',
+        ]);
         await wrapper.get('.button-row button').trigger('click');
         await flushPromises();
         expect(mocks.openLicense).toHaveBeenCalledOnce();
+
+        const homepageButton = wrapper.findAll('.button-row button')[1];
+        expect(homepageButton.attributes('disabled')).toBeUndefined();
+        await homepageButton.trigger('click');
+        await flushPromises();
+        expect(mocks.openProjectHomepage).toHaveBeenCalledOnce();
     });
 });

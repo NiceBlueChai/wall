@@ -14,6 +14,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
+const PROJECT_HOMEPAGE: &str = "https://github.com/NiceBlueChai/wall";
+
 pub struct RuntimeState {
     core: Mutex<WallCore>,
     player: Mutex<MpvPlayer>,
@@ -284,9 +286,12 @@ pub fn open_license(app: AppHandle) -> Result<(), AppError> {
         .map_err(|problem| error("open_license_failed", &problem.to_string(), true))
 }
 
+/// 将官方项目主页交给系统默认浏览器打开。
 #[tauri::command]
-pub fn open_project_homepage() -> Result<(), AppError> {
-    Err(error("homepage_not_configured", "项目主页尚未配置", true))
+pub fn open_project_homepage(app: AppHandle) -> Result<(), AppError> {
+    app.opener()
+        .open_url(PROJECT_HOMEPAGE, None::<String>)
+        .map_err(|problem| error("open_homepage_failed", &problem.to_string(), true))
 }
 
 #[tauri::command]
@@ -376,5 +381,15 @@ fn error(code: &str, message: &str, recoverable: bool) -> AppError {
         code: code.to_owned(),
         message: message.to_owned(),
         recoverable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PROJECT_HOMEPAGE;
+
+    #[test]
+    fn project_homepage_points_to_the_public_repository() {
+        assert_eq!(PROJECT_HOMEPAGE, "https://github.com/NiceBlueChai/wall");
     }
 }

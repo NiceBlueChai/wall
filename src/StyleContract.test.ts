@@ -13,6 +13,8 @@ describe('Figma style contract', () => {
         expect(css).not.toContain('.back-button::before');
         expect(css).toContain('.card-preview { position: relative; height: 150px;');
         expect(css).toContain('.empty-state { width: 360px; height: 220px;');
+        expect(css).toContain('.about-panel { height: 344px; display: flex; flex-direction: column; gap: 16px;');
+        expect(css).toContain('.about-contact { display: grid; grid-template-columns: 77px auto; row-gap: 4px;');
     });
 
     it('keeps Figma action and selection colors', () => {

@@ -712,10 +712,10 @@ input[type='range']:hover::-webkit-slider-thumb {
     padding-bottom: 14px;
 }
 .about-panel {
-    height: 304px;
+    height: 344px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
     padding: 24px;
     overflow: hidden;
 }
@@ -756,6 +756,19 @@ input[type='range']:hover::-webkit-slider-thumb {
     margin: 0;
     font-size: 13px;
     font-weight: 500;
+}
+.about-contact {
+    display: grid;
+    grid-template-columns: 77px auto;
+    row-gap: 4px;
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+}
+.about-contact dt,
+.about-contact dd {
+    margin: 0;
 }
 .button-row {
     display: flex;

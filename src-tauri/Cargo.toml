@@ -2,7 +2,7 @@
 name = "wall"
 version = "1.0.0"
 description = "完全离线的 Windows 动态壁纸工具"
-authors = ["Wall contributors"]
+authors = ["NiceBlueChai <bluechai@qq.com>"]
 license = "MIT"
 edition = "2024"
 
