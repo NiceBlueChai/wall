@@ -1,0 +1,11 @@
+{
+    "$schema": "../gen/schemas/desktop-schema.json",
+    "identifier": "default",
+    "description": "Wall 主窗口仅允许导入本地媒体和使用基础窗口能力。",
+    "windows": ["main"],
+    "permissions": [
+        "core:default",
+        "dialog:allow-open"
+    ]
+}
+

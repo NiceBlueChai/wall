@@ -1,0 +1,12 @@
+node_modules/
+.codex/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/*.exe
+src-tauri/binaries/*.dll
+src-tauri/binaries/mpv/
+release/
+*.log
+.DS_Store
