@@ -364,7 +364,10 @@ fn player_error(problem: PlayerError) -> AppError {
         PlayerError::MissingDesktopHost => {
             error("desktop_host_missing", &problem.to_string(), true)
         }
-        PlayerError::Io(_) => error("playback_failed", &problem.to_string(), true),
+        PlayerError::WindowTimeout
+        | PlayerError::EarlyExit(_)
+        | PlayerError::Embedding(_)
+        | PlayerError::Io(_) => error("playback_failed", &problem.to_string(), true),
     }
 }
 

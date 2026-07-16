@@ -11,14 +11,24 @@ fn video_arguments_enable_loop_ipc_and_desktop_embedding() {
     let arguments = build_mpv_arguments(
         Path::new(r"D:\Wallpapers\ocean.mp4"),
         MediaKind::Video,
-        42,
+        "wall-wallpaper-test",
+        1920,
+        1080,
         r"\\.\pipe\wall-mpv",
         &settings,
     );
 
     assert!(arguments.contains(&"--no-config".to_owned()));
     assert!(arguments.contains(&"--loop-file=inf".to_owned()));
-    assert!(arguments.contains(&"--wid=42".to_owned()));
+    assert!(arguments.contains(&"--force-window=immediate".to_owned()));
+    assert!(arguments.contains(&"--no-border".to_owned()));
+    assert!(arguments.contains(&"--title=wall-wallpaper-test".to_owned()));
+    assert!(arguments.contains(&"--geometry=1920x1080+0+0".to_owned()));
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.starts_with("--wid="))
+    );
     assert!(arguments.contains(&r"--input-ipc-server=\\.\pipe\wall-mpv".to_owned()));
     assert!(arguments.contains(&"--hwdec=auto-safe".to_owned()));
     assert!(arguments.contains(&"--panscan=1.0".to_owned()));
@@ -33,7 +43,9 @@ fn image_and_stretch_arguments_are_explicit() {
     let arguments = build_mpv_arguments(
         Path::new("aurora.png"),
         MediaKind::Image,
-        7,
+        "wall-image-test",
+        1280,
+        720,
         "wall",
         &settings,
     );
