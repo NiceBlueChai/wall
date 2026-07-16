@@ -1,0 +1,22 @@
+# Keeps source and documentation line endings deterministic on every platform.
+* text=auto
+
+*.css text eol=crlf
+*.html text eol=crlf
+*.json text eol=crlf
+*.md text eol=crlf
+*.ps1 text eol=crlf
+*.rs text eol=crlf
+*.toml text eol=crlf
+*.ts text eol=crlf
+*.vue text eol=crlf
+*.yaml text eol=crlf
+*.yml text eol=crlf
+
+*.dll binary
+*.exe binary
+*.ico binary
+*.jpg binary
+*.mp4 binary
+*.png binary
+*.webp binary

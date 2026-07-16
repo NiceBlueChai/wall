@@ -1,0 +1,43 @@
+# Validates the offline Wall frontend and Rust core on Windows.
+name: CI
+
+on:
+    push:
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: windows-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Set up Rust
+              shell: pwsh
+              run: |
+                  rustup update stable
+                  rustup default stable
+
+            - name: Install frontend dependencies
+              run: npm ci
+
+            - name: Test frontend
+              run: npm run test
+
+            - name: Build frontend
+              run: npm run build
+
+            - name: Check Rust formatting
+              run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+            - name: Test Rust core
+              run: cargo test --manifest-path src-tauri/Cargo.toml

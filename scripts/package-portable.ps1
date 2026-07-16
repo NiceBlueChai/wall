@@ -15,6 +15,9 @@ foreach ($file in @("mpv.exe", "d3dcompiler_43.dll")) {
         throw "$file is missing. Run scripts\prepare-mpv.ps1 first."
     }
 }
+if (-not (Get-Command ffmpeg -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw "ffmpeg is missing. Install it before building the portable package."
+}
 
 Push-Location $ProjectRoot
 try {
@@ -42,5 +45,9 @@ Copy-Item -LiteralPath (Join-Path $MpvDirectory "d3dcompiler_43.dll") -Destinati
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") -Destination $Stage
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") -Destination $Stage
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") -Destination $Stage
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.zh-CN.md") -Destination $Stage
+$SampleStage = Join-Path $Stage "Sample Wallpapers"
+& (Join-Path $PSScriptRoot "create-sample-wallpapers.ps1") -Destination $SampleStage
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "samples\README.md") -Destination $SampleStage
 Compress-Archive -LiteralPath $Stage -DestinationPath $Archive -CompressionLevel Optimal
 Write-Host "Portable package created: $Archive"
