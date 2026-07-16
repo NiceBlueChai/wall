@@ -3,19 +3,9 @@
 import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { open } from '@tauri-apps/plugin-dialog';
-import {
-    mediaUrl,
-    openMediaFolder,
-    play,
-    relocateMedia,
-    removeMedia,
-    setMuted,
-    setScaleMode,
-    setVolume,
-    stop,
-    togglePause,
-} from '../api';
+import { mediaUrl, openMediaFolder, play, relocateMedia, setScaleMode, setVolume, stop, togglePause } from '../api';
 import { wallStore } from '../store';
+import WallIcon from '../components/WallIcon.vue';
 import type { ScaleMode } from '../types';
 
 const route = useRoute();
@@ -32,12 +22,6 @@ async function action(task: () => Promise<unknown>) {
     } catch (error) {
         errorMessage.value = readError(error);
     }
-}
-
-async function removeCurrent() {
-    if (!item.value || !window.confirm(`从壁纸库移除“${item.value.name}”？原文件不会被删除。`)) return;
-    await action(() => removeMedia(item.value!.id));
-    if (!errorMessage.value) router.push('/');
 }
 
 async function relocate() {
@@ -64,20 +48,18 @@ function readError(error: unknown): string {
 <template>
     <section v-if="item" class="page detail-page">
         <div class="page-heading">
-            <button class="back-button" @click="router.push('/')">‹</button>
+            <button class="back-button" title="返回壁纸库" aria-label="返回壁纸库" @click="router.push('/')">
+                <WallIcon name="back" :size="20" />
+            </button>
             <h1>{{ item.name }}</h1>
-            <button class="danger-quiet" @click="removeCurrent">从库中移除</button>
+            <button v-if="!item.missing" class="primary button-medium" @click="action(() => play(item!.id))">
+                设为壁纸
+            </button>
         </div>
         <div class="detail-grid">
             <div class="media-preview">
                 <img v-if="item.kind === 'image' && mediaUrl(item.path)" :src="mediaUrl(item.path)" :alt="item.name" />
-                <video
-                    v-else-if="item.kind === 'video' && mediaUrl(item.path)"
-                    :src="mediaUrl(item.path)"
-                    muted
-                    controls
-                    loop
-                />
+                <video v-else-if="item.kind === 'video' && mediaUrl(item.path)" :src="mediaUrl(item.path)" muted loop />
                 <div v-else class="preview-fallback">{{ item.kind === 'video' ? 'VIDEO' : 'IMAGE' }}</div>
             </div>
             <aside class="detail-card">
@@ -103,12 +85,11 @@ function readError(error: unknown): string {
                 </div>
                 <div class="detail-actions">
                     <button v-if="item.missing" class="primary" @click="relocate">定位新文件</button>
-                    <button v-else class="primary" @click="action(() => play(item!.id))">设为壁纸</button>
                     <button class="secondary" :disabled="!active" @click="action(togglePause)">
                         {{ paused ? '继续' : '暂停' }}
                     </button>
-                    <button class="secondary" :disabled="!active" @click="action(stop)">停止</button>
-                    <button class="secondary" @click="action(() => openMediaFolder(item!.id))">打开文件夹</button>
+                    <button class="danger" :disabled="!active" @click="action(stop)">停止</button>
+                    <button class="secondary" @click="action(() => openMediaFolder(item!.id))">打开文件位置</button>
                 </div>
             </aside>
         </div>
@@ -133,16 +114,10 @@ function readError(error: unknown): string {
                     min="0"
                     max="100"
                     :value="wallStore.snapshot.playback.volume"
+                    :style="{ '--range-progress': `${wallStore.snapshot.playback.volume}%` }"
                     @change="action(() => setVolume(Number(($event.target as HTMLInputElement).value)))"
                 />
             </div>
-            <button
-                class="secondary mute-button"
-                :disabled="!active"
-                @click="action(() => setMuted(!wallStore.snapshot.playback.muted))"
-            >
-                {{ wallStore.snapshot.playback.muted ? '取消静音' : '静音' }}
-            </button>
         </div>
         <p v-if="errorMessage" class="inline-error">
             {{ errorMessage }}

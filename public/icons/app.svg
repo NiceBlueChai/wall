@@ -1,0 +1,11 @@
+<svg preserveAspectRatio="none" width="100%" height="100%" overflow="visible" style="display: block;" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="App Icon" clip-path="url(#clip0_0_13)">
+<path id="Vector" d="M35.25 0H12.75C5.70837 0 0 5.70837 0 12.75V35.25C0 42.2916 5.70837 48 12.75 48H35.25C42.2916 48 48 42.2916 48 35.25V12.75C48 5.70837 42.2916 0 35.25 0Z" fill="var(--fill-0, #7C5CFF)"/>
+<path id="Vector_2" d="M9 14.25L16.5 33.75L24 18L31.5 33.75L39 14.25" stroke="var(--stroke-0, white)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<defs>
+<clipPath id="clip0_0_13">
+<rect width="48" height="48" fill="white"/>
+</clipPath>
+</defs>
+</svg>

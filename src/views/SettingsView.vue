@@ -4,6 +4,7 @@ import { computed, ref } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { openLicense, openProjectHomepage, updateSettings } from '../api';
 import { wallStore } from '../store';
+import WallIcon from '../components/WallIcon.vue';
 import type { AppSettings } from '../types';
 
 const route = useRoute();
@@ -159,6 +160,7 @@ function readError(error: unknown): string {
                     min="0"
                     max="100"
                     :value="settings.volume"
+                    :style="{ '--range-progress': `${settings.volume}%` }"
                     @change="change('volume', Number(($event.target as HTMLInputElement).value))"
                 />
             </div>
@@ -208,7 +210,7 @@ function readError(error: unknown): string {
         <div v-else class="settings-panel about-panel">
             <h2>关于 Wall</h2>
             <div class="about-brand">
-                <img :src="'/wall-app-icon.png'" alt="Wall" />
+                <WallIcon name="app" :size="48" />
                 <div>
                     <h3>Wall</h3>
                     <b>v1.0.0</b><span>Windows 10/11 x64</span><small>免费开源 · 完全离线</small>
@@ -216,8 +218,10 @@ function readError(error: unknown): string {
             </div>
             <p>本地视频与图片动态壁纸工具</p>
             <div class="button-row">
-                <button class="secondary" @click="run(openLicense)">查看开源许可证</button
-                ><button class="secondary" disabled @click="run(openProjectHomepage)">打开项目主页</button>
+                <button class="secondary button-medium" @click="run(openLicense)">查看开源许可证</button
+                ><button class="secondary button-medium" disabled @click="run(openProjectHomepage)">
+                    打开项目主页
+                </button>
             </div>
             <small class="offline-notice">项目主页尚未配置；Wall 自身不请求网络。</small>
         </div>

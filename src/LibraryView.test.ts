@@ -1,14 +1,16 @@
 /** 验证壁纸库的空状态和媒体卡片是同一响应式数据源。 */
 // @vitest-environment jsdom
 
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultSettings, wallStore } from './store';
 import LibraryView from './views/LibraryView.vue';
 
-vi.mock('./api', () => ({ importMedia: vi.fn(), mediaUrl: vi.fn(() => ''), play: vi.fn() }));
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
+const mocks = vi.hoisted(() => ({ importMedia: vi.fn(), open: vi.fn(), play: vi.fn() }));
+
+vi.mock('./api', () => ({ importMedia: mocks.importMedia, mediaUrl: vi.fn(() => ''), play: mocks.play }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: mocks.open }));
 
 describe('LibraryView', () => {
     it('switches from the import empty state to a wallpaper card', async () => {
@@ -19,7 +21,10 @@ describe('LibraryView', () => {
         await router.push('/');
         await router.isReady();
         const wrapper = mount(LibraryView, { global: { plugins: [router] } });
-        expect(wrapper.text()).toContain('导入第一张壁纸');
+        expect(wrapper.text()).toContain('还没有壁纸');
+        expect(wrapper.find('.empty-area').exists()).toBe(true);
+        expect(wrapper.get('.empty-state img').attributes('src')).toBe('/icons/info.svg');
+        expect(wrapper.find('.empty-state button').exists()).toBe(false);
 
         wallStore.applySnapshot({
             library: [
@@ -48,6 +53,20 @@ describe('LibraryView', () => {
         });
         await wrapper.vm.$nextTick();
         expect(wrapper.text()).toContain('Ocean Loop');
-        expect(wrapper.text()).not.toContain('导入第一张壁纸');
+        expect(wrapper.text()).not.toContain('还没有壁纸');
+
+        await wrapper.get('.wallpaper-card').trigger('dblclick');
+        await flushPromises();
+        expect(mocks.play).toHaveBeenCalledWith('ocean');
+
+        mocks.open.mockResolvedValueOnce('D:\\Wallpapers\\new.mp4');
+        await wrapper.get('.heading-actions .primary').trigger('click');
+        await flushPromises();
+        expect(mocks.importMedia).toHaveBeenCalledWith(['D:\\Wallpapers\\new.mp4']);
+
+        wallStore.search = 'not-found';
+        await wrapper.vm.$nextTick();
+        expect(wrapper.text()).toContain('没有搜索结果');
+        expect(wrapper.get('.compact-empty img').attributes('src')).toBe('/icons/search.svg');
     });
 });

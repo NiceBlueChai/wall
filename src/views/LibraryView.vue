@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router';
 import { open } from '@tauri-apps/plugin-dialog';
 import { importMedia, mediaUrl, play } from '../api';
 import { wallStore } from '../store';
+import WallIcon from '../components/WallIcon.vue';
 import type { WallpaperItem } from '../types';
 
 const router = useRouter();
@@ -58,10 +59,11 @@ function readError(error: unknown): string {
         <div class="page-heading">
             <h1>壁纸库</h1>
             <div class="heading-actions">
-                <label class="search-field"
-                    ><span>⌕</span><input v-model="wallStore.search" placeholder="搜索壁纸"
-                /></label>
-                <button class="primary" @click="chooseMedia">＋ 导入壁纸</button>
+                <label class="search-field">
+                    <WallIcon name="search" :size="16" />
+                    <input v-model="wallStore.search" placeholder="搜索本地壁纸" />
+                </label>
+                <button class="primary button-medium" @click="chooseMedia">导入壁纸</button>
             </div>
         </div>
         <div class="tabs library-tabs">
@@ -79,15 +81,17 @@ function readError(error: unknown): string {
             </button>
         </div>
 
-        <div v-if="!library.length && !wallStore.snapshot.library.length" class="empty-state">
-            <div class="empty-icon">▧</div>
-            <h2>导入第一张壁纸</h2>
-            <p>支持本地视频和图片，文件始终保留在原位置。</p>
-            <button class="primary" @click="chooseMedia">导入壁纸</button>
-        </div>
-        <div v-else-if="!library.length" class="empty-state compact-empty">
-            <h2>没有匹配的壁纸</h2>
-            <p>试试其他关键词或媒体类型。</p>
+        <div v-if="!library.length" class="empty-area">
+            <div v-if="!wallStore.snapshot.library.length" class="empty-state">
+                <WallIcon name="info" :size="32" />
+                <h2>还没有壁纸</h2>
+                <p>导入本地视频或图片开始使用</p>
+            </div>
+            <div v-else class="empty-state compact-empty">
+                <WallIcon name="search" :size="32" />
+                <h2>没有搜索结果</h2>
+                <p>尝试其他文件名或清除筛选</p>
+            </div>
         </div>
         <div v-else class="wallpaper-grid">
             <article
@@ -108,17 +112,15 @@ function readError(error: unknown): string {
                         muted
                         preload="metadata"
                     />
-                    <span class="media-badge">{{ item.kind === 'video' ? 'VIDEO' : 'IMAGE' }}</span>
-                    <span v-if="item.missing" class="missing-badge">文件丢失</span>
                 </div>
                 <div class="card-copy">
                     <strong>{{ item.name }}</strong
-                    ><small
-                        >{{ item.format
-                        }}<template v-if="item.width"> · {{ item.width }} × {{ item.height }}</template></small
-                    >
+                    ><small>
+                        {{ item.kind.toUpperCase() }}<template v-if="item.missing"> · 文件丢失</template
+                        ><template v-else-if="wallStore.snapshot.playback.activeId === item.id"> · 正在运行</template
+                        ><template v-else-if="item.width"> · {{ item.width }} × {{ item.height }}</template>
+                    </small>
                 </div>
-                <i v-if="wallStore.snapshot.playback.activeId === item.id" class="running-dot" />
             </article>
         </div>
 

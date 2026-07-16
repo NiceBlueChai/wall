@@ -1,0 +1,5 @@
+<svg preserveAspectRatio="none" width="100%" height="100%" overflow="visible" style="display: block;" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="Icon / volume">
+<path id="Vector" d="M15 9C15.4256 9.37537 15.7665 9.83701 16 10.3542C16.2335 10.8715 16.3542 11.4325 16.3542 12C16.3542 12.5675 16.2335 13.1285 16 13.6458C15.7665 14.163 15.4256 14.6246 15 15M18 6C18.8513 6.75073 19.533 7.67401 20 8.7085C20.467 9.74298 20.7085 10.865 20.7085 12C20.7085 13.135 20.467 14.257 20 15.2915C19.533 16.326 18.8513 17.2493 18 18M11 5L6 9H3V15H6L11 19V5Z" stroke="var(--stroke-0, #A6ACC7)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>
