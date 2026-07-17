@@ -569,15 +569,7 @@ pub fn update_settings(
     let mut core = state.core()?;
     let previous_snapshot = core.snapshot().clone();
     let previous_auto_start = previous_snapshot.settings.auto_start;
-    if settings.auto_start {
-        app.autolaunch()
-            .enable()
-            .map_err(|problem| error("autostart_failed", &problem.to_string(), true))?;
-    } else {
-        app.autolaunch()
-            .disable()
-            .map_err(|problem| error("autostart_failed", &problem.to_string(), true))?;
-    }
+    let auto_start_updated = sync_autostart(&app, previous_auto_start, settings.auto_start)?;
     let active_id = core.snapshot().playback.active_id.clone();
     let mut running_media_ids = core
         .snapshot()
@@ -645,7 +637,9 @@ pub fn update_settings(
                         &rollback_assignments,
                     );
                 }
-                restore_autostart(&app, previous_auto_start);
+                if auto_start_updated {
+                    restore_autostart(&app, previous_auto_start);
+                }
                 *core = WallCore::new(previous_snapshot);
                 return Err(app_error);
             }
@@ -724,6 +718,30 @@ pub fn set_wallpaper_settings(
         core.set_media_playback_settings(&media_id, effective.default_muted, effective.volume)?;
     }
     state.commit(&app, core)
+}
+
+fn autostart_transition(previous: bool, requested: bool) -> Option<bool> {
+    (previous != requested).then_some(requested)
+}
+
+fn sync_autostart(app: &AppHandle, previous: bool, requested: bool) -> Result<bool, AppError> {
+    let Some(enabled) = autostart_transition(previous, requested) else {
+        return Ok(false);
+    };
+    let manager = app.autolaunch();
+    let current = manager
+        .is_enabled()
+        .map_err(|problem| error("autostart_failed", &problem.to_string(), true))?;
+    if current == enabled {
+        return Ok(false);
+    }
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|problem| error("autostart_failed", &problem.to_string(), true))?;
+    Ok(true)
 }
 
 fn restore_autostart(app: &AppHandle, enabled: bool) {
@@ -974,14 +992,22 @@ fn error(code: &str, message: &str, recoverable: bool) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROJECT_HOMEPAGE, discard_disabled_session, online_pause_transitions, pause_transitions,
-        prepare_commit,
+        PROJECT_HOMEPAGE, autostart_transition, discard_disabled_session, online_pause_transitions,
+        pause_transitions, prepare_commit,
     };
     use crate::core::WallCore;
     use crate::model::{AppSnapshot, DisplayAssignment, DisplayMode, PauseReason, PlaybackStatus};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn unrelated_setting_changes_do_not_touch_autostart() {
+        assert_eq!(autostart_transition(false, false), None);
+        assert_eq!(autostart_transition(true, true), None);
+        assert_eq!(autostart_transition(false, true), Some(true));
+        assert_eq!(autostart_transition(true, false), Some(false));
+    }
 
     #[test]
     fn commit_waits_without_core_lock_and_uses_the_latest_snapshot() {
