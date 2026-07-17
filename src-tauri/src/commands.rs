@@ -11,7 +11,8 @@ use crate::tray::TrayMenuState;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, mpsc};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as _;
@@ -19,10 +20,49 @@ use tauri_plugin_opener::OpenerExt as _;
 
 const PROJECT_HOMEPAGE: &str = "https://github.com/NiceBlueChai/wall";
 
+struct SnapshotPublisher {
+    sender: mpsc::Sender<AppSnapshot>,
+}
+
+impl SnapshotPublisher {
+    fn new(app: AppHandle, data_dir: PathBuf) -> std::io::Result<Self> {
+        Self::spawn(move |snapshot| {
+            if let Err(problem) = app.emit("app-state://changed", &snapshot) {
+                write_log(&data_dir, "publish", &problem.to_string());
+            }
+            if let Some(tray) = app.try_state::<TrayMenuState>() {
+                tray.update(&snapshot);
+            }
+        })
+    }
+
+    fn spawn<F>(publish: F) -> std::io::Result<Self>
+    where
+        F: Fn(AppSnapshot) + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("wall-state-publisher".to_owned())
+            .spawn(move || {
+                for snapshot in receiver {
+                    publish(snapshot);
+                }
+            })?;
+        Ok(Self { sender })
+    }
+
+    fn publish(&self, snapshot: AppSnapshot) -> Result<(), AppError> {
+        self.sender
+            .send(snapshot)
+            .map_err(|problem| error("publish_failed", &problem.to_string(), true))
+    }
+}
+
 pub struct RuntimeState {
     core: Mutex<WallCore>,
     commit_gate: Mutex<()>,
     player: Mutex<MpvPlayerManager>,
+    publisher: SnapshotPublisher,
     storage: Storage,
     mpv_binary: PathBuf,
     data_dir: PathBuf,
@@ -45,10 +85,12 @@ impl RuntimeState {
         }
         let mut core = WallCore::new(snapshot);
         core.set_displays(collect_displays(app.handle())?);
+        let publisher = SnapshotPublisher::new(app.handle().clone(), data_dir.clone())?;
         Ok(Self {
             core: Mutex::new(core),
             commit_gate: Mutex::new(()),
             player: Mutex::new(MpvPlayerManager::default()),
+            publisher,
             storage,
             mpv_binary: resolve_mpv_binary(),
             data_dir,
@@ -57,22 +99,7 @@ impl RuntimeState {
 
     /// 将无法向界面返回的后台错误追加到本地日志。
     pub fn log_error(&self, context: &str, message: &str) {
-        let logs = self.data_dir.join("logs");
-        if std::fs::create_dir_all(&logs).is_err() {
-            return;
-        }
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(logs.join("wall.log"))
-        else {
-            return;
-        };
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or_default();
-        let _ = writeln!(file, "{timestamp} [{context}] {message}");
+        write_log(&self.data_dir, context, message);
     }
 
     fn core(&self) -> Result<MutexGuard<'_, WallCore>, AppError> {
@@ -89,20 +116,36 @@ impl RuntimeState {
 
     fn commit(
         &self,
-        app: &AppHandle,
+        _app: &AppHandle,
         core: MutexGuard<'_, WallCore>,
     ) -> Result<AppSnapshot, AppError> {
-        let (snapshot, _commit_guard) = prepare_commit(&self.core, core, &self.commit_gate)?;
-        self.storage
-            .save(&snapshot)
-            .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
-        app.emit("app-state://changed", &snapshot)
-            .map_err(|problem| error("event_failed", &problem.to_string(), true))?;
-        if let Some(tray) = app.try_state::<TrayMenuState>() {
-            tray.update(&snapshot);
-        }
+        let snapshot = persist_snapshot(&self.core, core, &self.commit_gate, |value| {
+            self.storage
+                .save(value)
+                .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
+            self.publisher.publish(value.clone())
+        })?;
         Ok(snapshot)
     }
+}
+
+fn write_log(data_dir: &Path, context: &str, message: &str) {
+    let logs = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join("wall.log"))
+    else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let _ = writeln!(file, "{timestamp} [{context}] {message}");
 }
 
 fn prepare_commit<'a>(
@@ -120,6 +163,21 @@ fn prepare_commit<'a>(
         .snapshot()
         .clone();
     Ok((snapshot, commit_guard))
+}
+
+fn persist_snapshot<F>(
+    core_mutex: &Mutex<WallCore>,
+    core: MutexGuard<'_, WallCore>,
+    commit_gate: &Mutex<()>,
+    persist: F,
+) -> Result<AppSnapshot, AppError>
+where
+    F: FnOnce(&AppSnapshot) -> Result<(), AppError>,
+{
+    let (snapshot, commit_guard) = prepare_commit(core_mutex, core, commit_gate)?;
+    persist(&snapshot)?;
+    drop(commit_guard);
+    Ok(snapshot)
 }
 
 fn discard_disabled_session(snapshot: &mut AppSnapshot) -> bool {
@@ -453,13 +511,14 @@ pub fn toggle_target_pause(
         .iter()
         .find(|assignment| assignment.target_id == target_id)
         .is_some_and(|assignment| assignment.status == crate::model::PlaybackStatus::Paused);
-    let player = state.player()?;
+    let mut player = state.player()?;
     if player.has_target(&target_id)
         && let Err(problem) = player.set_target_paused(&target_id, paused)
     {
         core.toggle_target_pause(&target_id)?;
         return Err(player_error(problem));
     }
+    drop(player);
     state.commit(&app, core)
 }
 
@@ -503,13 +562,14 @@ pub fn set_target_muted(
         .map(|assignment| assignment.muted)
         .ok_or_else(|| error("display_target_not_found", "显示目标不存在", true))?;
     core.set_target_muted(&target_id, muted)?;
-    let player = state.player()?;
+    let mut player = state.player()?;
     if player.has_target(&target_id)
         && let Err(problem) = player.set_target_muted(&target_id, muted)
     {
         core.set_target_muted(&target_id, previous)?;
         return Err(player_error(problem));
     }
+    drop(player);
     state.commit(&app, core)
 }
 
@@ -831,7 +891,7 @@ pub fn set_automatic_pause(
     core.set_pause_reason(reason, paused);
     let after = core.snapshot().playback.display_assignments.clone();
     if !before.is_empty() {
-        let player = state.player()?;
+        let mut player = state.player()?;
         let transitions =
             online_pause_transitions(pause_transitions(&before, &after), |target_id| {
                 player.has_target(target_id)
@@ -847,6 +907,7 @@ pub fn set_automatic_pause(
             }
             applied.push((target_id, target_paused));
         }
+        drop(player);
         return state.commit(&app, core);
     }
     let is_paused = core.snapshot().playback.is_paused();
@@ -914,7 +975,7 @@ pub fn set_target_automatic_pause(
         .iter()
         .find(|assignment| assignment.target_id == target_id)
         .is_some_and(|assignment| assignment.status == crate::model::PlaybackStatus::Paused);
-    let player = state.player()?;
+    let mut player = state.player()?;
     if was_paused != is_paused
         && player.has_target(target_id)
         && let Err(problem) = player.set_target_paused(target_id, is_paused)
@@ -922,6 +983,7 @@ pub fn set_target_automatic_pause(
         *core = WallCore::new(previous_snapshot);
         return Err(player_error(problem));
     }
+    drop(player);
     state.commit(&app, core)
 }
 
@@ -977,6 +1039,8 @@ fn player_error(problem: PlayerError) -> AppError {
         PlayerError::WindowTimeout
         | PlayerError::EarlyExit(_)
         | PlayerError::Embedding(_)
+        | PlayerError::Command(_)
+        | PlayerError::Rollback(_)
         | PlayerError::Io(_) => error("playback_failed", &problem.to_string(), true),
     }
 }
@@ -992,12 +1056,12 @@ fn error(code: &str, message: &str, recoverable: bool) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROJECT_HOMEPAGE, autostart_transition, discard_disabled_session, online_pause_transitions,
-        pause_transitions, prepare_commit,
+        PROJECT_HOMEPAGE, SnapshotPublisher, autostart_transition, discard_disabled_session,
+        online_pause_transitions, pause_transitions, persist_snapshot, prepare_commit,
     };
     use crate::core::WallCore;
     use crate::model::{AppSnapshot, DisplayAssignment, DisplayMode, PauseReason, PlaybackStatus};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1036,6 +1100,42 @@ mod tests {
         drop(held_gate);
 
         assert_eq!(worker.join().expect("worker"), latest);
+    }
+
+    #[test]
+    fn commit_gate_covers_persistence_and_publish_enqueue() {
+        let core = Mutex::new(WallCore::new(AppSnapshot::default()));
+        let commit_gate = Mutex::new(());
+        let core_guard = core.lock().expect("core lock");
+        let snapshot = persist_snapshot(&core, core_guard, &commit_gate, |_| {
+            assert!(commit_gate.try_lock().is_err());
+            Ok(())
+        })
+        .expect("persist snapshot");
+
+        assert_eq!(snapshot, AppSnapshot::default());
+        assert!(commit_gate.try_lock().is_ok());
+    }
+
+    #[test]
+    fn snapshot_publisher_preserves_commit_order() {
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let publisher = SnapshotPublisher::spawn(move |snapshot| {
+            observed_sender
+                .send(snapshot.playback.volume)
+                .expect("observe snapshot");
+        })
+        .expect("publisher thread");
+        let mut first = AppSnapshot::default();
+        first.playback.volume = 10;
+        let mut second = AppSnapshot::default();
+        second.playback.volume = 20;
+
+        publisher.publish(first).expect("publish first");
+        publisher.publish(second).expect("publish second");
+
+        assert_eq!(observed_receiver.recv().expect("first snapshot"), 10);
+        assert_eq!(observed_receiver.recv().expect("second snapshot"), 20);
     }
 
     #[test]

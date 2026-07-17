@@ -147,6 +147,38 @@ pub fn build_live_settings_commands(
     ]
 }
 
+fn loadfile_command(media_path: &Path, request_id: i64) -> serde_json::Value {
+    json!({
+        "command": ["loadfile", media_path.to_string_lossy(), "replace"],
+        "request_id": request_id
+    })
+}
+
+fn ipc_request_id(command: &serde_json::Value) -> Result<i64, PlayerError> {
+    command
+        .get("request_id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mpv IPC 请求缺少 request_id",
+            )
+            .into()
+        })
+}
+
+fn validate_loadfile_response(response: &serde_json::Value) -> Result<(), PlayerError> {
+    let status = response
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("mpv IPC 响应缺少 error 字段");
+    if status == "success" {
+        Ok(())
+    } else {
+        Err(PlayerError::Command(status.to_owned()))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PlayerError {
     #[error("未找到随 Wall 分发的 mpv.exe")]
@@ -159,6 +191,10 @@ pub enum PlayerError {
     EarlyExit(Option<i32>),
     #[error("无法把 mpv 窗口嵌入桌面：{0}")]
     Embedding(String),
+    #[error("mpv 拒绝播放命令：{0}")]
+    Command(String),
+    #[error("{0}")]
+    Rollback(String),
     #[error("无法启动或控制 mpv：{0}")]
     Io(#[from] std::io::Error),
 }
@@ -299,6 +335,11 @@ impl MpvPlayer {
         Ok(())
     }
 
+    fn load_media(&self, media_path: &Path) -> Result<(), PlayerError> {
+        let response = self.request(loadfile_command(media_path, 2))?;
+        validate_loadfile_response(&response)
+    }
+
     /// 停止当前 mpv 进程；管道不可用时直接终止子进程。
     pub fn stop(&mut self) {
         if let Some(stop) = self.order_stop.take() {
@@ -360,6 +401,7 @@ impl MpvPlayer {
     }
 
     fn request(&self, command: serde_json::Value) -> Result<serde_json::Value, PlayerError> {
+        let request_id = ipc_request_id(&command)?;
         let pipe_name = self
             .pipe_name
             .as_ref()
@@ -374,7 +416,11 @@ impl MpvPlayer {
         };
         serde_json::to_writer(&mut pipe, &command).map_err(std::io::Error::other)?;
         pipe.write_all(b"\n")?;
-        read_ipc_response(&mut pipe, 1, Instant::now() + Duration::from_secs(2))
+        read_ipc_response(
+            &mut pipe,
+            request_id,
+            Instant::now() + Duration::from_secs(2),
+        )
     }
 }
 
@@ -458,7 +504,54 @@ struct PlayerGroup {
     mode: DisplayMode,
     display_ids: Vec<String>,
     regions: Vec<ScreenRegion>,
+    paused: bool,
+    muted: bool,
+    volume: u8,
     players: Vec<MpvPlayer>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn can_hot_switch(
+    group: &PlayerGroup,
+    binary: &Path,
+    kind: MediaKind,
+    settings: &AppSettings,
+    mode: DisplayMode,
+    display_ids: &[String],
+    regions: &[ScreenRegion],
+    player_count: usize,
+) -> bool {
+    group.binary == binary
+        && group.kind == kind
+        && group.settings.hardware_decoding == settings.hardware_decoding
+        && group.mode == mode
+        && group.display_ids == display_ids
+        && group.regions == regions
+        && group.players.len() == player_count
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FailedSwitchDisposition {
+    RestartKeep,
+    RestartDrop,
+    RejectKeep,
+    RejectDrop(String),
+}
+
+fn failed_switch_disposition(
+    problem: &PlayerError,
+    rollback_errors: &[String],
+) -> FailedSwitchDisposition {
+    let restart = matches!(problem, PlayerError::Io(_) | PlayerError::EarlyExit(_));
+    match (restart, rollback_errors.is_empty()) {
+        (true, true) => FailedSwitchDisposition::RestartKeep,
+        (true, false) => FailedSwitchDisposition::RestartDrop,
+        (false, true) => FailedSwitchDisposition::RejectKeep,
+        (false, false) => FailedSwitchDisposition::RejectDrop(format!(
+            "{problem}；回滚失败：{}",
+            rollback_errors.join("；")
+        )),
+    }
 }
 
 /// 管理独立显示器和联动显示器组中的全部 mpv 实例。
@@ -532,6 +625,153 @@ impl MpvPlayerManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_hot_switch(
+        &mut self,
+        target_id: &str,
+        media_id: &str,
+        binary: &Path,
+        media_path: &Path,
+        kind: MediaKind,
+        settings: &AppSettings,
+        mode: DisplayMode,
+        display_ids: &[String],
+        regions: &[ScreenRegion],
+        target_regions: &[ScreenRegion],
+        paused: bool,
+        muted: bool,
+        volume: u8,
+    ) -> Result<bool, PlayerError> {
+        let Some(mut group) = self.groups.remove(target_id) else {
+            return Ok(false);
+        };
+        if !can_hot_switch(
+            &group,
+            binary,
+            kind,
+            settings,
+            mode,
+            display_ids,
+            regions,
+            target_regions.len(),
+        ) {
+            self.groups.insert(target_id.to_owned(), group);
+            return Ok(false);
+        }
+        for player in &mut group.players {
+            if !matches!(player.has_exited(), Ok(false)) {
+                self.groups.insert(target_id.to_owned(), group);
+                return Ok(false);
+            }
+        }
+
+        let previous_path = group.media_path.clone();
+        let previous_settings = group.settings.clone();
+        let previous_paused = group.paused;
+        let previous_muted = group.muted;
+        let previous_volume = group.volume;
+        let switch_result = (|| {
+            for (index, player) in group.players.iter().enumerate() {
+                player.load_media(media_path)?;
+                let mut player_settings = settings.clone();
+                if mode == DisplayMode::Clone && index > 0 {
+                    player_settings.default_muted = true;
+                }
+                player.apply_settings(&player_settings)?;
+            }
+            if mode == DisplayMode::Clone && group.players.len() > 1 {
+                for player in &group.players {
+                    player.set_paused(true)?;
+                    player.send(json!({ "command": ["set_property", "time-pos", 0] }))?;
+                }
+                for player in &group.players {
+                    player.set_paused(false)?;
+                }
+            }
+            for (index, player) in group.players.iter().enumerate() {
+                player.set_paused(paused)?;
+                player.set_muted(muted || index > 0)?;
+                player.set_volume(volume)?;
+            }
+            Ok(())
+        })();
+        if let Err(problem) = switch_result {
+            let mut rollback_errors = Vec::new();
+            for (index, player) in group.players.iter().enumerate() {
+                if let Err(rollback) = player.load_media(&previous_path) {
+                    rollback_errors.push(format!(
+                        "实例 {} 恢复媒体失败：{rollback}",
+                        index.saturating_add(1)
+                    ));
+                }
+                let mut player_settings = previous_settings.clone();
+                if group.mode == DisplayMode::Clone && index > 0 {
+                    player_settings.default_muted = true;
+                }
+                if let Err(rollback) = player.apply_settings(&player_settings) {
+                    rollback_errors.push(format!(
+                        "实例 {} 恢复设置失败：{rollback}",
+                        index.saturating_add(1)
+                    ));
+                }
+                if let Err(rollback) = player.set_paused(previous_paused) {
+                    rollback_errors.push(format!(
+                        "实例 {} 恢复暂停状态失败：{rollback}",
+                        index.saturating_add(1)
+                    ));
+                }
+                if let Err(rollback) = player.set_muted(previous_muted || index > 0) {
+                    rollback_errors.push(format!(
+                        "实例 {} 恢复静音状态失败：{rollback}",
+                        index.saturating_add(1)
+                    ));
+                }
+                if let Err(rollback) = player.set_volume(previous_volume) {
+                    rollback_errors.push(format!(
+                        "实例 {} 恢复音量失败：{rollback}",
+                        index.saturating_add(1)
+                    ));
+                }
+            }
+            return match failed_switch_disposition(&problem, &rollback_errors) {
+                FailedSwitchDisposition::RestartKeep => {
+                    self.groups.insert(target_id.to_owned(), group);
+                    Ok(false)
+                }
+                FailedSwitchDisposition::RestartDrop => {
+                    for player in &mut group.players {
+                        player.stop();
+                    }
+                    Ok(false)
+                }
+                FailedSwitchDisposition::RejectKeep => {
+                    self.groups.insert(target_id.to_owned(), group);
+                    Err(problem)
+                }
+                FailedSwitchDisposition::RejectDrop(message) => {
+                    for player in &mut group.players {
+                        player.stop();
+                    }
+                    Err(PlayerError::Rollback(message))
+                }
+            };
+        }
+
+        group.media_id = media_id.to_owned();
+        group.binary = binary.to_path_buf();
+        group.media_path = media_path.to_path_buf();
+        group.kind = kind;
+        group.settings = settings.clone();
+        group.mode = mode;
+        group.display_ids = display_ids.to_vec();
+        group.regions = regions.to_vec();
+        group.paused = paused;
+        group.muted = muted;
+        group.volume = volume;
+        self.groups.insert(target_id.to_owned(), group);
+        Ok(true)
+    }
+
     /// 完成初始暂停与声音配置后，再原子替换占用相同显示器的旧播放器组。
     #[allow(clippy::too_many_arguments)]
     pub fn play_target_configured(
@@ -558,6 +798,23 @@ impl MpvPlayerManager {
             }
             DisplayMode::Clone => regions.to_vec(),
         };
+        if self.try_hot_switch(
+            target_id,
+            media_id,
+            binary,
+            media_path,
+            kind,
+            settings,
+            mode,
+            display_ids,
+            regions,
+            &target_regions,
+            paused,
+            muted,
+            volume,
+        )? {
+            return Ok(());
+        }
         let mut players: Vec<MpvPlayer> = Vec::with_capacity(target_regions.len());
         for (index, region) in target_regions.iter().copied().enumerate() {
             let mut player = MpvPlayer::default();
@@ -619,6 +876,9 @@ impl MpvPlayerManager {
                 mode,
                 display_ids: display_ids.to_vec(),
                 regions: regions.to_vec(),
+                paused,
+                muted,
+                volume,
                 players,
             },
         );
@@ -626,77 +886,84 @@ impl MpvPlayerManager {
     }
 
     /// 暂停或继续全部显示目标。
-    pub fn set_paused(&self, paused: bool) -> Result<(), PlayerError> {
-        for group in self.groups.values() {
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), PlayerError> {
+        for group in self.groups.values_mut() {
             for player in &group.players {
                 player.set_paused(paused)?;
             }
+            group.paused = paused;
         }
         Ok(())
     }
 
     /// 暂停或继续一个显示目标。
-    pub fn set_target_paused(&self, target_id: &str, paused: bool) -> Result<(), PlayerError> {
+    pub fn set_target_paused(&mut self, target_id: &str, paused: bool) -> Result<(), PlayerError> {
         let group = self
             .groups
-            .get(target_id)
+            .get_mut(target_id)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
         for player in &group.players {
             player.set_paused(paused)?;
         }
+        group.paused = paused;
         Ok(())
     }
 
     /// 设置每个显示目标的单一音源静音状态。
-    pub fn set_muted(&self, muted: bool) -> Result<(), PlayerError> {
-        for group in self.groups.values() {
+    pub fn set_muted(&mut self, muted: bool) -> Result<(), PlayerError> {
+        for group in self.groups.values_mut() {
             for (index, player) in group.players.iter().enumerate() {
                 player.set_muted(muted || index > 0)?;
             }
+            group.muted = muted;
         }
         Ok(())
     }
 
     /// 设置一个显示目标的单一音源静音状态。
-    pub fn set_target_muted(&self, target_id: &str, muted: bool) -> Result<(), PlayerError> {
+    pub fn set_target_muted(&mut self, target_id: &str, muted: bool) -> Result<(), PlayerError> {
         let group = self
             .groups
-            .get(target_id)
+            .get_mut(target_id)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
         for (index, player) in group.players.iter().enumerate() {
             player.set_muted(muted || index > 0)?;
         }
+        group.muted = muted;
         Ok(())
     }
 
     /// 设置一个显示目标的音量。
-    pub fn set_target_volume(&self, target_id: &str, volume: u8) -> Result<(), PlayerError> {
+    pub fn set_target_volume(&mut self, target_id: &str, volume: u8) -> Result<(), PlayerError> {
         let group = self
             .groups
-            .get(target_id)
+            .get_mut(target_id)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
         for player in &group.players {
             player.set_volume(volume)?;
         }
+        group.volume = volume;
         Ok(())
     }
 
     /// 设置全部显示目标的音量。
-    pub fn set_volume(&self, volume: u8) -> Result<(), PlayerError> {
-        for group in self.groups.values() {
+    pub fn set_volume(&mut self, volume: u8) -> Result<(), PlayerError> {
+        for group in self.groups.values_mut() {
             for player in &group.players {
                 player.set_volume(volume)?;
             }
+            group.volume = volume;
         }
         Ok(())
     }
 
     /// 动态更新全部显示目标的缩放方式。
-    pub fn set_scale_mode(&self, settings: &AppSettings) -> Result<(), PlayerError> {
-        for group in self.groups.values() {
+    pub fn set_scale_mode(&mut self, settings: &AppSettings) -> Result<(), PlayerError> {
+        for group in self.groups.values_mut() {
             for player in &group.players {
                 player.set_scale_mode(settings)?;
             }
+            group.settings.scale_mode = settings.scale_mode;
         }
         Ok(())
     }
@@ -704,7 +971,6 @@ impl MpvPlayerManager {
     /// 动态更新全部无需重启的播放器设置。
     pub fn apply_settings(&mut self, settings: &AppSettings) -> Result<(), PlayerError> {
         for group in self.groups.values_mut() {
-            group.settings = settings.clone();
             for (index, player) in group.players.iter().enumerate() {
                 let mut player_settings = settings.clone();
                 if group.mode == DisplayMode::Clone && index > 0 {
@@ -712,6 +978,7 @@ impl MpvPlayerManager {
                 }
                 player.apply_settings(&player_settings)?;
             }
+            group.settings = settings.clone();
         }
         Ok(())
     }
@@ -1105,7 +1372,14 @@ fn ensure_window_order(_player_window: isize, _shell_view: isize) {}
 
 #[cfg(test)]
 mod tests {
-    use super::embedding_flags;
+    use super::{
+        FailedSwitchDisposition, MpvPlayer, PlayerError, PlayerGroup, ScreenRegion, can_hot_switch,
+        embedding_flags, failed_switch_disposition, ipc_request_id, loadfile_command,
+        validate_loadfile_response,
+    };
+    use crate::model::{AppSettings, DisplayMode, MediaKind};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
 
     const SWP_NO_Z_ORDER: u32 = 0x0004;
     const SWP_FRAME_CHANGED: u32 = 0x0020;
@@ -1119,5 +1393,166 @@ mod tests {
         assert_eq!(raised_flags & SWP_NO_Z_ORDER, 0);
         assert_eq!(legacy_flags & SWP_FRAME_CHANGED, SWP_FRAME_CHANGED);
         assert_eq!(legacy_flags & SWP_NO_Z_ORDER, SWP_NO_Z_ORDER);
+    }
+
+    #[test]
+    fn hot_switch_requires_the_same_player_contract() {
+        let region = ScreenRegion {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let group = PlayerGroup {
+            media_id: "old".to_owned(),
+            binary: PathBuf::from("mpv.exe"),
+            media_path: PathBuf::from("old.mp4"),
+            kind: MediaKind::Video,
+            settings: AppSettings::default(),
+            mode: DisplayMode::Independent,
+            display_ids: vec!["DISPLAY1".to_owned()],
+            regions: vec![region],
+            paused: false,
+            muted: true,
+            volume: 0,
+            players: vec![MpvPlayer::default()],
+        };
+
+        assert!(can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Image,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("other-mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            2,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings {
+                hardware_decoding: false,
+                ..Default::default()
+            },
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Clone,
+            &["DISPLAY1".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY2".to_owned()],
+            &[region],
+            1,
+        ));
+        assert!(!can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Video,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[ScreenRegion { x: 10, ..region }],
+            1,
+        ));
+    }
+
+    #[test]
+    fn hot_switch_loadfile_command_replaces_current_media() {
+        let command = loadfile_command(Path::new(r"D:\Wallpapers\next.mp4"), 2);
+        assert_eq!(
+            command,
+            json!({
+                "command": ["loadfile", r"D:\Wallpapers\next.mp4", "replace"],
+                "request_id": 2
+            })
+        );
+        assert_eq!(ipc_request_id(&command).expect("request ID"), 2);
+    }
+
+    #[test]
+    fn loadfile_response_rejects_mpv_errors() {
+        assert!(validate_loadfile_response(&json!({ "error": "success" })).is_ok());
+
+        let error = validate_loadfile_response(&json!({ "error": "loading failed" }))
+            .expect_err("mpv rejection must be returned");
+        assert!(matches!(
+            error,
+            PlayerError::Command(message) if message == "loading failed"
+        ));
+    }
+
+    #[test]
+    fn failed_switch_drops_a_group_when_rollback_is_incomplete() {
+        let command_error = PlayerError::Command("loading failed".to_owned());
+        assert_eq!(
+            failed_switch_disposition(&command_error, &[]),
+            FailedSwitchDisposition::RejectKeep
+        );
+        assert_eq!(
+            failed_switch_disposition(&command_error, &["实例 1 恢复媒体失败".to_owned()]),
+            FailedSwitchDisposition::RejectDrop(
+                "mpv 拒绝播放命令：loading failed；回滚失败：实例 1 恢复媒体失败".to_owned()
+            )
+        );
+
+        let io_error = PlayerError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "pipe closed",
+        ));
+        assert_eq!(
+            failed_switch_disposition(&io_error, &[]),
+            FailedSwitchDisposition::RestartKeep
+        );
+        assert_eq!(
+            failed_switch_disposition(&io_error, &["实例 2 恢复设置失败".to_owned()]),
+            FailedSwitchDisposition::RestartDrop
+        );
     }
 }
