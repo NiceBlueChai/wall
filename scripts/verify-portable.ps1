@@ -4,24 +4,15 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$WallDirectory,
 
-    [Parameter(Mandatory = $true)]
     [string]$VideoPath,
+
+    [switch]$UseExistingData,
 
     [switch]$RecoverInterruptedRun
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $WallDirectory = [IO.Path]::GetFullPath($WallDirectory).TrimEnd('\')
-$VideoPath = (Resolve-Path -LiteralPath $VideoPath).Path
-$WallExecutable = Join-Path $WallDirectory "Wall.exe"
-if (-not (Test-Path -LiteralPath $WallExecutable)) {
-    throw "Wall.exe is missing from $WallDirectory."
-}
-if (-not $RecoverInterruptedRun -and (Get-Process Wall -ErrorAction SilentlyContinue)) {
-    throw "A Wall process is already running; close it before the automated smoke test."
-}
-
 $AppDataRoot = [IO.Path]::GetFullPath($env:APPDATA).TrimEnd('\')
 $DataDirectory = [IO.Path]::GetFullPath((Join-Path $AppDataRoot "com.wall.app")).TrimEnd('\')
 if (-not $DataDirectory.StartsWith("$AppDataRoot\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -30,13 +21,11 @@ if (-not $DataDirectory.StartsWith("$AppDataRoot\", [StringComparison]::OrdinalI
 if ((Split-Path -Leaf $DataDirectory) -ne "com.wall.app") {
     throw "The resolved Wall data directory has an unexpected name."
 }
-$BackupDirectory = "$DataDirectory.verify-$([guid]::NewGuid().ToString('N'))"
-$HadData = Test-Path -LiteralPath $DataDirectory
+$InterruptedBackups = @(Get-ChildItem -LiteralPath $AppDataRoot -Force -Directory | Where-Object {
+    $_.Name -like "com.wall.app.verify-*"
+})
 
 if ($RecoverInterruptedRun) {
-    $InterruptedBackups = @(Get-ChildItem -LiteralPath $AppDataRoot -Force -Directory | Where-Object {
-        $_.Name -like "com.wall.app.verify-*"
-    })
     if ($InterruptedBackups.Count -ne 1) {
         throw "Expected exactly one interrupted verification backup, found $($InterruptedBackups.Count)."
     }
@@ -44,6 +33,9 @@ if ($RecoverInterruptedRun) {
         $_.Path -and (Split-Path -Parent $_.Path).TrimEnd('\') -eq $WallDirectory
     }) | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 400
+    if (Get-Process Wall -ErrorAction SilentlyContinue) {
+        throw "Another Wall process is still running; close it before recovering application data."
+    }
     if (Test-Path -LiteralPath $DataDirectory) {
         Remove-Item -LiteralPath $DataDirectory -Recurse -Force
     }
@@ -51,6 +43,23 @@ if ($RecoverInterruptedRun) {
     Write-Host "INTERRUPTED_RUN_RECOVERED: $DataDirectory"
     exit 0
 }
+if ($InterruptedBackups.Count -gt 0) {
+    throw "An interrupted verification backup exists; run this script with -RecoverInterruptedRun first."
+}
+if (-not $VideoPath) {
+    throw "VideoPath is required unless -RecoverInterruptedRun is used."
+}
+$VideoPath = (Resolve-Path -LiteralPath $VideoPath).Path
+$WallExecutable = Join-Path $WallDirectory "Wall.exe"
+if (-not (Test-Path -LiteralPath $WallExecutable)) {
+    throw "Wall.exe is missing from $WallDirectory."
+}
+if (Get-Process Wall -ErrorAction SilentlyContinue) {
+    throw "A Wall process is already running; close it before the automated smoke test."
+}
+
+$BackupDirectory = "$DataDirectory.verify-$([guid]::NewGuid().ToString('N'))"
+$HadData = Test-Path -LiteralPath $DataDirectory
 
 function Get-TreeHashes {
     param([Parameter(Mandatory = $true)][string]$Root)
@@ -73,45 +82,72 @@ $NativeProcess = $null
 $NativeOutput = Join-Path ([IO.Path]::GetTempPath()) "wall-native-$([guid]::NewGuid().ToString('N')).out"
 $NativeError = "$NativeOutput.err"
 try {
-    New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
-    $Library = @(
-        [ordered]@{
-            id = "portable-verification-video"
-            name = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
-            path = $VideoPath
-            kind = "video"
-            format = "MP4"
-            width = $null
-            height = $null
-            durationSeconds = $null
-            thumbnailPath = $null
-            missing = $false
+    if ($UseExistingData) {
+        if (-not $HadData) {
+            throw "Wall has no existing application data to verify."
         }
-    )
-    $Session = [ordered]@{
-        activeId = "portable-verification-video"
-        status = "playing"
-        muted = $true
-        volume = 0
-        pauseReasons = @()
-        lastError = $null
+        Copy-Item -LiteralPath $BackupDirectory -Destination $DataDirectory -Recurse -Force
+    } else {
+        New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
+        $Library = @(
+            [ordered]@{
+                id = "portable-verification-video"
+                name = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
+                path = $VideoPath
+                kind = "video"
+                format = "MP4"
+                width = $null
+                height = $null
+                durationSeconds = $null
+                thumbnailPath = $null
+                missing = $false
+            }
+        )
+        $Session = [ordered]@{
+            activeId = "portable-verification-video"
+            status = "playing"
+            muted = $true
+            volume = 0
+            pauseReasons = @()
+            lastError = $null
+        }
+        ConvertTo-Json -InputObject $Library -Depth 5 | Set-Content -LiteralPath `
+            (Join-Path $DataDirectory "library.json") -Encoding utf8
+        ConvertTo-Json -InputObject $Session -Depth 5 | Set-Content -LiteralPath `
+            (Join-Path $DataDirectory "session.json") -Encoding utf8
     }
-    ConvertTo-Json -InputObject $Library -Depth 5 | Set-Content -LiteralPath `
-        (Join-Path $DataDirectory "library.json") -Encoding utf8
-    ConvertTo-Json -InputObject $Session -Depth 5 | Set-Content -LiteralPath `
-        (Join-Path $DataDirectory "session.json") -Encoding utf8
 
     $WallProcess = Start-Process -FilePath $WallExecutable -WorkingDirectory $WallDirectory `
         -WindowStyle Hidden -PassThru
     $Deadline = [DateTime]::UtcNow.AddSeconds(25)
+    $ResponsiveDeadline = [DateTime]::UtcNow.AddSeconds(6)
     do {
         Start-Sleep -Milliseconds 250
+        if ([DateTime]::UtcNow -ge $ResponsiveDeadline) {
+            $WallProcess.Refresh()
+            if (-not $WallProcess.Responding) {
+                throw "Wall stopped processing Windows messages while waiting for mpv."
+            }
+        }
         $MpvProcess = @(Get-Process mpv -ErrorAction SilentlyContinue | Where-Object {
             $_.Path -and (Split-Path -Parent $_.Path).TrimEnd('\') -eq $WallDirectory
         }) | Select-Object -First 1
     } while (-not $MpvProcess -and [DateTime]::UtcNow -lt $Deadline)
     if (-not $MpvProcess) {
         throw "Wall did not start its bundled mpv within 25 seconds."
+    }
+
+    Start-Sleep -Seconds 6
+    $WallProcess.Refresh()
+    if (-not $WallProcess.Responding) {
+        throw "Wall stopped processing Windows messages after startup."
+    }
+
+    $MpvProcess = @(Get-Process mpv -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and (Split-Path -Parent $_.Path).TrimEnd('\') -eq $WallDirectory
+    }) | Select-Object -First 1
+    if (-not $MpvProcess) {
+        throw "Wall lost its bundled mpv process after startup."
     }
 
     $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($MpvProcess.Id)").CommandLine

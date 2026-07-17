@@ -21,6 +21,7 @@ const PROJECT_HOMEPAGE: &str = "https://github.com/NiceBlueChai/wall";
 
 pub struct RuntimeState {
     core: Mutex<WallCore>,
+    commit_gate: Mutex<()>,
     player: Mutex<MpvPlayerManager>,
     storage: Storage,
     mpv_binary: PathBuf,
@@ -46,6 +47,7 @@ impl RuntimeState {
         core.set_displays(collect_displays(app.handle())?);
         Ok(Self {
             core: Mutex::new(core),
+            commit_gate: Mutex::new(()),
             player: Mutex::new(MpvPlayerManager::default()),
             storage,
             mpv_binary: resolve_mpv_binary(),
@@ -85,8 +87,12 @@ impl RuntimeState {
             .map_err(|_| error("player_poisoned", "播放器状态暂时不可用", true))
     }
 
-    fn commit(&self, app: &AppHandle, core: &WallCore) -> Result<AppSnapshot, AppError> {
-        let snapshot = core.snapshot().clone();
+    fn commit(
+        &self,
+        app: &AppHandle,
+        core: MutexGuard<'_, WallCore>,
+    ) -> Result<AppSnapshot, AppError> {
+        let (snapshot, _commit_guard) = prepare_commit(&self.core, core, &self.commit_gate)?;
         self.storage
             .save(&snapshot)
             .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
@@ -97,6 +103,23 @@ impl RuntimeState {
         }
         Ok(snapshot)
     }
+}
+
+fn prepare_commit<'a>(
+    core_mutex: &Mutex<WallCore>,
+    core: MutexGuard<'_, WallCore>,
+    commit_gate: &'a Mutex<()>,
+) -> Result<(AppSnapshot, MutexGuard<'a, ()>), AppError> {
+    drop(core);
+    let commit_guard = commit_gate
+        .lock()
+        .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+    let snapshot = core_mutex
+        .lock()
+        .map_err(|_| error("state_poisoned", "应用状态暂时不可用", false))?
+        .snapshot()
+        .clone();
+    Ok((snapshot, commit_guard))
 }
 
 fn discard_disabled_session(snapshot: &mut AppSnapshot) -> bool {
@@ -127,7 +150,7 @@ pub fn import_media(
             .allow_file(&item.path)
             .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
     }
-    state.commit(&app, &core)?;
+    state.commit(&app, core)?;
     Ok(imported)
 }
 
@@ -202,7 +225,7 @@ pub fn refresh_displays(app: AppHandle, state: State<'_, RuntimeState>) -> Resul
         }
     }
     if core.snapshot() != &before {
-        state.commit(&app, &core)?;
+        state.commit(&app, core)?;
     }
     Ok(())
 }
@@ -216,7 +239,7 @@ pub fn create_category(
 ) -> Result<AppSnapshot, AppError> {
     let mut core = state.core()?;
     core.create_category(&name)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 重命名用户分类并保持现有壁纸归属。
@@ -229,7 +252,7 @@ pub fn rename_category(
 ) -> Result<AppSnapshot, AppError> {
     let mut core = state.core()?;
     core.rename_category(&category_id, &name)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 删除分类并仅解除归属，不删除媒体项目或源文件。
@@ -241,7 +264,7 @@ pub fn delete_category(
 ) -> Result<AppSnapshot, AppError> {
     let mut core = state.core()?;
     core.delete_category(&category_id)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 批量添加或移除壁纸分类，并在提交前验证所有标识。
@@ -255,7 +278,7 @@ pub fn set_category_membership(
 ) -> Result<AppSnapshot, AppError> {
     let mut core = state.core()?;
     core.set_category_membership(&media_ids, &category_id, assigned)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 选择独立、复制或铺展显示器组，并广播最新快照。
@@ -268,7 +291,7 @@ pub fn set_display_layout(
 ) -> Result<AppSnapshot, AppError> {
     let mut core = state.core()?;
     core.set_display_layout(mode, display_ids)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -280,7 +303,7 @@ pub fn remove_media(
     let mut core = state.core()?;
     core.remove(&media_id)?;
     state.player()?.stop_media(&media_id);
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -295,7 +318,7 @@ pub fn relocate_media(
     app.asset_protocol_scope()
         .allow_file(&path)
         .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -343,11 +366,11 @@ pub fn play(
         *core = WallCore::new(previous_snapshot);
         if !had_active_target {
             core.set_playback_error(app_error.message.clone());
-            state.commit(&app, &core)?;
+            state.commit(&app, core)?;
         }
         return Err(app_error);
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 fn start_assignment_player(
@@ -411,7 +434,7 @@ pub fn toggle_pause(
         .player()?
         .set_paused(core.snapshot().playback.is_paused())
         .map_err(player_error)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 切换单个显示目标的手动暂停状态。
@@ -437,7 +460,7 @@ pub fn toggle_target_pause(
         core.toggle_target_pause(&target_id)?;
         return Err(player_error(problem));
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -445,7 +468,7 @@ pub fn stop(app: AppHandle, state: State<'_, RuntimeState>) -> Result<AppSnapsho
     let mut core = state.core()?;
     core.stop();
     state.player()?.stop();
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -459,7 +482,7 @@ pub fn set_muted(
     if core.snapshot().playback.active_id.is_some() {
         state.player()?.set_muted(muted).map_err(player_error)?;
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 设置单个显示目标的静音状态。
@@ -487,7 +510,7 @@ pub fn set_target_muted(
         core.set_target_muted(&target_id, previous)?;
         return Err(player_error(problem));
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 停止单个显示目标。
@@ -500,7 +523,7 @@ pub fn stop_target(
     let mut core = state.core()?;
     core.stop_target(&target_id)?;
     state.player()?.stop_target(&target_id);
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -514,7 +537,7 @@ pub fn set_volume(
     if core.snapshot().playback.active_id.is_some() {
         state.player()?.set_volume(volume).map_err(player_error)?;
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -531,7 +554,7 @@ pub fn set_scale_mode(
             .set_scale_mode(&core.snapshot().settings)
             .map_err(player_error)?;
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 #[tauri::command]
@@ -638,7 +661,7 @@ pub fn update_settings(
         core.set_volume(effective.volume)?;
     }
     core.update_settings(settings)?;
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 更新单张壁纸覆盖项，并在该壁纸运行时实时应用有效设置。
@@ -700,7 +723,7 @@ pub fn set_wallpaper_settings(
         }
         core.set_media_playback_settings(&media_id, effective.default_muted, effective.volume)?;
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 fn restore_autostart(app: &AppHandle, enabled: bool) {
@@ -806,7 +829,7 @@ pub fn set_automatic_pause(
             }
             applied.push((target_id, target_paused));
         }
-        return state.commit(&app, &core);
+        return state.commit(&app, core);
     }
     let is_paused = core.snapshot().playback.is_paused();
     if was_paused != is_paused
@@ -815,7 +838,7 @@ pub fn set_automatic_pause(
         *core = WallCore::new(previous_snapshot);
         return Err(player_error(problem));
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 fn pause_transitions(
@@ -881,7 +904,7 @@ pub fn set_target_automatic_pause(
         *core = WallCore::new(previous_snapshot);
         return Err(player_error(problem));
     }
-    state.commit(&app, &core)
+    state.commit(&app, core)
 }
 
 /// 由后台监视器定期校准复制组播放位置。
@@ -952,8 +975,42 @@ fn error(code: &str, message: &str, recoverable: bool) -> AppError {
 mod tests {
     use super::{
         PROJECT_HOMEPAGE, discard_disabled_session, online_pause_transitions, pause_transitions,
+        prepare_commit,
     };
+    use crate::core::WallCore;
     use crate::model::{AppSnapshot, DisplayAssignment, DisplayMode, PauseReason, PlaybackStatus};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn commit_waits_without_core_lock_and_uses_the_latest_snapshot() {
+        let core = Arc::new(Mutex::new(WallCore::new(AppSnapshot::default())));
+        let commit_gate = Arc::new(Mutex::new(()));
+        let held_gate = commit_gate.lock().expect("commit gate");
+        let worker_core = Arc::clone(&core);
+        let worker_gate = Arc::clone(&commit_gate);
+        let worker = thread::spawn(move || {
+            let core_guard = worker_core.lock().expect("core lock");
+            let (snapshot, _commit_guard) =
+                prepare_commit(&worker_core, core_guard, &worker_gate).expect("prepare commit");
+            snapshot
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut latest = None;
+        while Instant::now() < deadline {
+            if let Ok(mut guard) = core.try_lock() {
+                guard.set_volume(42).expect("set volume");
+                latest = Some(guard.snapshot().clone());
+                break;
+            }
+            thread::yield_now();
+        }
+        let latest = latest.expect("worker must release core before waiting for commit gate");
+        drop(held_gate);
+
+        assert_eq!(worker.join().expect("worker"), latest);
+    }
 
     #[test]
     fn project_homepage_points_to_the_public_repository() {
