@@ -12,12 +12,17 @@ describe('Wall store', () => {
             language: 'zh-CN',
             scaleMode: 'cover',
             frameRate: 60,
+            aspectRatio: 'original',
+            antiAliasing: 'balanced',
             hardwareDecoding: true,
             defaultMuted: true,
             volume: 0,
             pauseOnFullscreen: true,
+            pauseOnMaximized: true,
             pauseOnBattery: true,
             pauseOnDisplaySleep: true,
+            displayMode: 'independent',
+            selectedDisplayIds: [],
         });
     });
 
@@ -25,6 +30,7 @@ describe('Wall store', () => {
         const store = createWallStore();
         store.applySnapshot({
             library: [media('1', 'Ocean Loop', 'video'), media('2', 'Aurora', 'image')],
+            categories: [],
             settings: defaultSettings(),
             playback: idlePlayback(),
         });
@@ -34,6 +40,40 @@ describe('Wall store', () => {
         store.search = '';
         store.filter = 'image';
         expect(store.filteredLibrary.map((item) => item.id)).toEqual(['2']);
+    });
+
+    it('filters the library by the selected user category', () => {
+        const store = createWallStore();
+        const ocean = { ...media('1', 'Ocean Loop', 'video'), categoryIds: ['nature'] };
+        const aurora = { ...media('2', 'Aurora', 'image'), categoryIds: ['space'] };
+        store.applySnapshot({
+            library: [ocean, aurora],
+            categories: [
+                { id: 'nature', name: '自然风景' },
+                { id: 'space', name: '太空' },
+            ],
+            settings: defaultSettings(),
+            playback: idlePlayback(),
+        });
+
+        store.activeCategoryId = 'nature';
+
+        expect(store.filteredLibrary.map((item) => item.id)).toEqual(['1']);
+    });
+
+    it('keeps batch selection in the store shared by the sidebar and library', () => {
+        const store = createWallStore();
+        store.enterBatchMode();
+        store.toggleMediaSelection('1');
+        store.toggleMediaSelection('2');
+        store.toggleMediaSelection('1');
+
+        expect(store.batchMode).toBe(true);
+        expect(store.selectedMediaIds).toEqual(['2']);
+
+        store.exitBatchMode();
+        expect(store.batchMode).toBe(false);
+        expect(store.selectedMediaIds).toEqual([]);
     });
 });
 
@@ -49,6 +89,7 @@ function media(id: string, name: string, kind: 'video' | 'image') {
         durationSeconds: kind === 'video' ? 30 : null,
         thumbnailPath: null,
         missing: false,
+        categoryIds: [],
     };
 }
 

@@ -1,7 +1,7 @@
 /** 封装 Wall 的 Tauri 命令与状态事件，保持视图只消费 AppSnapshot。 */
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AppSettings, AppSnapshot, ScaleMode } from './types';
+import type { AppSettings, AppSnapshot, DisplayMode, ScaleMode, WallpaperSettings } from './types';
 import { wallStore } from './store';
 
 /** 从 Rust 恢复完整应用快照。 */
@@ -29,12 +29,24 @@ export async function importMedia(paths: string[]) {
 
 export const play = (mediaId: string) => snapshotCommand('play', { mediaId });
 export const togglePause = () => snapshotCommand('toggle_pause');
+export const toggleTargetPause = (targetId: string) => snapshotCommand('toggle_target_pause', { targetId });
 export const stop = () => snapshotCommand('stop');
+export const stopTarget = (targetId: string) => snapshotCommand('stop_target', { targetId });
 export const setMuted = (muted: boolean) => snapshotCommand('set_muted', { muted });
 export const setVolume = (volume: number) => snapshotCommand('set_volume', { volume });
 export const setScaleMode = (mode: ScaleMode) => snapshotCommand('set_scale_mode', { mode });
 export const removeMedia = (mediaId: string) => snapshotCommand('remove_media', { mediaId });
 export const relocateMedia = (mediaId: string, path: string) => snapshotCommand('relocate_media', { mediaId, path });
+export const createCategory = (name: string) => snapshotCommand('create_category', { name });
+export const renameCategory = (categoryId: string, name: string) =>
+    snapshotCommand('rename_category', { categoryId, name });
+export const deleteCategory = (categoryId: string) => snapshotCommand('delete_category', { categoryId });
+export const setCategoryMembership = (mediaIds: string[], categoryId: string, assigned: boolean) =>
+    snapshotCommand('set_category_membership', { mediaIds, categoryId, assigned });
+export const setWallpaperSettings = (mediaId: string, settings: WallpaperSettings) =>
+    snapshotCommand('set_wallpaper_settings', { mediaId, settings });
+export const setDisplayLayout = (mode: DisplayMode, displayIds: string[]) =>
+    snapshotCommand('set_display_layout', { mode, displayIds });
 export const updateSettings = (settings: AppSettings) => snapshotCommand('update_settings', { settings });
 export const openMediaFolder = (mediaId: string) => invoke('open_media_folder', { mediaId });
 export const openLogs = () => invoke('open_logs');

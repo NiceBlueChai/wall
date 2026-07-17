@@ -103,7 +103,7 @@ function readError(error: unknown): string {
         </div>
 
         <div v-else-if="section === 'playback'" class="settings-panel playback-panel">
-            <h2>播放</h2>
+            <h2>画面</h2>
             <div class="setting-row">
                 <div><strong>缩放方式</strong><small>默认等比例填满并居中裁切</small></div>
                 <div class="segmented compact">
@@ -118,11 +118,56 @@ function readError(error: unknown): string {
                 </div>
             </div>
             <div class="setting-row">
+                <div><strong>画幅</strong><small>覆盖视频的逻辑宽高比</small></div>
+                <select
+                    data-setting="aspect-ratio"
+                    :value="settings.aspectRatio"
+                    @change="
+                        change('aspectRatio', ($event.target as HTMLSelectElement).value as AppSettings['aspectRatio'])
+                    "
+                >
+                    <option value="original">原始</option>
+                    <option value="screen">屏幕</option>
+                    <option value="ratio16x9">16:9</option>
+                    <option value="ratio16x10">16:10</option>
+                    <option value="ratio21x9">21:9</option>
+                    <option value="ratio32x9">32:9</option>
+                    <option value="ratio4x3">4:3</option>
+                    <option value="ratio1x1">1:1</option>
+                    <option value="ratio9x16">9:16</option>
+                </select>
+            </div>
+            <div class="setting-row">
+                <div><strong>抗锯齿</strong><small>更高质量会增加 GPU 占用</small></div>
+                <select
+                    data-setting="anti-aliasing"
+                    :value="settings.antiAliasing"
+                    @change="
+                        change(
+                            'antiAliasing',
+                            ($event.target as HTMLSelectElement).value as AppSettings['antiAliasing'],
+                        )
+                    "
+                >
+                    <option value="off">关闭</option>
+                    <option value="balanced">均衡</option>
+                    <option value="high">高质量</option>
+                </select>
+            </div>
+            <div class="setting-row">
                 <div><strong>帧率上限</strong><small>降低数值可以减少 GPU 占用</small></div>
                 <select
+                    data-setting="frame-rate"
                     :value="settings.frameRate"
-                    @change="change('frameRate', Number(($event.target as HTMLSelectElement).value) as 30 | 60)"
+                    @change="
+                        change(
+                            'frameRate',
+                            Number(($event.target as HTMLSelectElement).value) as AppSettings['frameRate'],
+                        )
+                    "
                 >
+                    <option :value="0">源帧率</option>
+                    <option :value="24">24 FPS</option>
                     <option :value="30">30 FPS</option>
                     <option :value="60">60 FPS</option>
                 </select>
@@ -139,6 +184,7 @@ function readError(error: unknown): string {
                     <i />
                 </button>
             </div>
+            <h2 class="settings-section-title">声音</h2>
             <div class="setting-row">
                 <div><strong>默认静音</strong><small>新导入的视频默认不播放声音</small></div>
                 <button
@@ -169,6 +215,18 @@ function readError(error: unknown): string {
         <div v-else-if="section === 'performance'" class="settings-panel performance-panel">
             <h2>自动暂停</h2>
             <p class="panel-description">在以下状态下自动暂停壁纸</p>
+            <div class="setting-row">
+                <div><strong>最大化应用时</strong><small>前台应用最大化并遮蔽桌面时暂停壁纸</small></div>
+                <button
+                    class="toggle"
+                    role="switch"
+                    :aria-checked="settings.pauseOnMaximized"
+                    :class="{ on: settings.pauseOnMaximized }"
+                    @click="change('pauseOnMaximized', !settings.pauseOnMaximized)"
+                >
+                    <i />
+                </button>
+            </div>
             <div class="setting-row">
                 <div><strong>全屏应用运行时</strong><small>游戏或全屏视频运行时暂停壁纸</small></div>
                 <button

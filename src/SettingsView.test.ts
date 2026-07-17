@@ -23,6 +23,7 @@ describe('SettingsView', () => {
     beforeEach(() => {
         wallStore.applySnapshot({
             library: [],
+            categories: [],
             settings: defaultSettings(),
             playback: {
                 activeId: null,
@@ -72,5 +73,30 @@ describe('SettingsView', () => {
         await homepageButton.trigger('click');
         await flushPromises();
         expect(mocks.openProjectHomepage).toHaveBeenCalledOnce();
+    });
+
+    it('exposes the confirmed picture, sound and maximized-pause settings', async () => {
+        const router = createRouter({
+            history: createMemoryHistory(),
+            routes: [{ path: '/settings/:section', component: SettingsView }],
+        });
+        await router.push('/settings/playback');
+        await router.isReady();
+        const wrapper = mount(SettingsView, { global: { plugins: [router] } });
+
+        expect(wrapper.text()).toContain('画面');
+        expect(wrapper.text()).toContain('声音');
+        expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('21:9');
+        expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('高质量');
+        expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('源帧率');
+
+        await wrapper.get('[data-setting="aspect-ratio"]').setValue('ratio21x9');
+        await flushPromises();
+        expect(mocks.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ aspectRatio: 'ratio21x9' }));
+
+        await router.push('/settings/performance');
+        await flushPromises();
+        expect(wrapper.text()).toContain('最大化应用时');
+        expect(wrapper.findAll('[role="switch"]')).toHaveLength(4);
     });
 });

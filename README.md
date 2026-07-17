@@ -15,10 +15,12 @@ selected by the user and provides no accounts, marketplace, cloud sync, telemetr
 
 ## Features
 
-- Local video and image wallpapers with Cover, Contain, and Stretch scaling.
-- mpv hardware decoding, looping, mute, volume, and frame-rate controls.
-- Automatic pause for fullscreen apps, battery power, and display sleep.
-- System tray controls, launch at startup, close to tray, and session restore.
+- Local video and image wallpapers with user categories and batch management.
+- Cover, Contain, and Stretch scaling, common aspect ratios, three anti-aliasing levels, and source/24/30/60 FPS.
+- Per-wallpaper overrides with global inheritance, mpv hardware decoding, looping, mute, and volume controls.
+- Independent, cloned, and spanned multi-display playback with per-target tray controls.
+- Automatic pause for fullscreen or maximized apps, battery power, and display sleep.
+- System tray controls, launch at startup, close to tray, display hot-plug retention, and session restore.
 - Fully offline runtime; the [project homepage](https://github.com/NiceBlueChai/wall) is only handed to the system
   browser after an explicit user action.
 
@@ -36,8 +38,8 @@ Microsoft Edge WebView2 Runtime if it is missing. The app and wallpaper playback
 
 - Operating systems: Windows 10/11 x64.
 - Media: local MP4, WebM, MKV, MOV, AVI, JPG, JPEG, PNG, WebP, BMP, and GIF files.
-- Displays: v1 manages the primary display only.
-- Not supported: online marketplace, web or interactive wallpapers, playlists, and per-monitor wallpapers.
+- Displays: primary or secondary displays in independent, cloned, or spanned layouts.
+- Not supported: online marketplace, web or interactive wallpapers, playlists, and scheduled rotation.
 
 ## Privacy and Data
 
@@ -68,6 +70,15 @@ Building the portable package with its three project-owned sample videos also re
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1
+```
+
+The no-mouse native smoke test starts the portable build, verifies the WorkerW hierarchy and GUI subsystem, and then
+restores the original application data by SHA-256:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
+    -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
+    -VideoPath C:\path\to\test.mp4
 ```
 
 ## Project Structure

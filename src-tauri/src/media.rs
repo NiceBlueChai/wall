@@ -78,6 +78,8 @@ fn wallpaper_item(path: PathBuf, kind: MediaKind) -> WallpaperItem {
         duration_seconds: None,
         thumbnail_path: None,
         missing: false,
+        category_ids: Vec::new(),
+        settings: Default::default(),
     }
 }
 

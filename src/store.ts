@@ -13,12 +13,17 @@ export function defaultSettings(): AppSettings {
         language: 'zh-CN',
         scaleMode: 'cover',
         frameRate: 60,
+        aspectRatio: 'original',
+        antiAliasing: 'balanced',
         hardwareDecoding: true,
         defaultMuted: true,
         volume: 0,
         pauseOnFullscreen: true,
+        pauseOnMaximized: true,
         pauseOnBattery: true,
         pauseOnDisplaySleep: true,
+        displayMode: 'independent',
+        selectedDisplayIds: [],
     };
 }
 
@@ -28,6 +33,9 @@ export function createWallStore() {
         snapshot: emptySnapshot(),
         search: '',
         filter: 'all' as LibraryFilter,
+        activeCategoryId: null as string | null,
+        batchMode: false,
+        selectedMediaIds: [] as string[],
     });
 
     return {
@@ -46,16 +54,48 @@ export function createWallStore() {
         set filter(value: LibraryFilter) {
             state.filter = value;
         },
+        get activeCategoryId() {
+            return state.activeCategoryId;
+        },
+        set activeCategoryId(value: string | null) {
+            state.activeCategoryId = value;
+        },
+        get batchMode() {
+            return state.batchMode;
+        },
+        get selectedMediaIds() {
+            return state.selectedMediaIds;
+        },
         get filteredLibrary(): WallpaperItem[] {
             const query = state.search.trim().toLocaleLowerCase();
             return state.snapshot.library.filter((item) => {
                 const matchesKind = state.filter === 'all' || item.kind === state.filter;
                 const matchesSearch = !query || item.name.toLocaleLowerCase().includes(query);
-                return matchesKind && matchesSearch;
+                const matchesCategory =
+                    state.activeCategoryId === null || item.categoryIds.includes(state.activeCategoryId);
+                return matchesKind && matchesSearch && matchesCategory;
             });
         },
         applySnapshot(snapshot: AppSnapshot) {
             state.snapshot = snapshot;
+            const mediaIds = new Set(snapshot.library.map((item) => item.id));
+            state.selectedMediaIds = state.selectedMediaIds.filter((id) => mediaIds.has(id));
+            if (state.activeCategoryId && !snapshot.categories.some((item) => item.id === state.activeCategoryId)) {
+                state.activeCategoryId = null;
+            }
+        },
+        enterBatchMode() {
+            state.batchMode = true;
+            state.selectedMediaIds = [];
+        },
+        exitBatchMode() {
+            state.batchMode = false;
+            state.selectedMediaIds = [];
+        },
+        toggleMediaSelection(mediaId: string) {
+            state.selectedMediaIds = state.selectedMediaIds.includes(mediaId)
+                ? state.selectedMediaIds.filter((id) => id !== mediaId)
+                : [...state.selectedMediaIds, mediaId];
         },
     };
 }
@@ -63,6 +103,7 @@ export function createWallStore() {
 function emptySnapshot(): AppSnapshot {
     return {
         library: [],
+        categories: [],
         settings: defaultSettings(),
         playback: {
             activeId: null,
@@ -72,6 +113,7 @@ function emptySnapshot(): AppSnapshot {
             pauseReasons: [],
             lastError: null,
         },
+        displays: [],
     };
 }
 

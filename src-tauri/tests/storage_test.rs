@@ -39,6 +39,42 @@ fn corrupted_settings_fall_back_without_losing_library() {
     fs::remove_dir_all(root).expect("clean test directory");
 }
 
+#[test]
+fn library_file_contains_items_and_categories() {
+    let root = test_root("library-state");
+    let storage = Storage::new(root.clone());
+    let mut snapshot = AppSnapshot::default();
+    snapshot.library.push(sample_wallpaper());
+
+    storage.save(&snapshot).expect("save snapshot");
+    let library: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("library.json")).expect("read library file"))
+            .expect("parse library file");
+
+    assert!(library["items"].is_array());
+    assert_eq!(library["categories"], serde_json::json!([]));
+    fs::remove_dir_all(root).expect("clean test directory");
+}
+
+#[test]
+fn loads_legacy_library_array_without_categories() {
+    let root = test_root("legacy-library");
+    fs::create_dir_all(&root).expect("create test directory");
+    fs::write(
+        root.join("library.json"),
+        serde_json::to_vec_pretty(&vec![sample_wallpaper()]).expect("serialize legacy library"),
+    )
+    .expect("write legacy library");
+
+    let loaded = Storage::new(root.clone())
+        .load()
+        .expect("load legacy library");
+
+    assert_eq!(loaded.library, vec![sample_wallpaper()]);
+    assert!(loaded.categories.is_empty());
+    fs::remove_dir_all(root).expect("clean test directory");
+}
+
 fn sample_wallpaper() -> WallpaperItem {
     WallpaperItem {
         id: "ocean".to_owned(),
@@ -51,6 +87,8 @@ fn sample_wallpaper() -> WallpaperItem {
         duration_seconds: Some(30.0),
         thumbnail_path: None,
         missing: false,
+        category_ids: Vec::new(),
+        settings: Default::default(),
     }
 }
 

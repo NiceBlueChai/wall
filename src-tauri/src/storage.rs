@@ -1,7 +1,7 @@
 //! 负责 Wall 用户数据目录中的 JSON 持久化。
 
-use crate::model::AppSnapshot;
-use serde::{Serialize, de::DeserializeOwned};
+use crate::model::{AppSnapshot, Category, WallpaperItem};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,20 @@ pub struct Storage {
     root: PathBuf,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryState {
+    items: Vec<WallpaperItem>,
+    categories: Vec<Category>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredLibrary {
+    Current(LibraryState),
+    Legacy(Vec<WallpaperItem>),
+}
+
 impl Storage {
     /// 创建指向应用数据目录的存储实例。
     pub fn new(root: PathBuf) -> Self {
@@ -27,20 +41,44 @@ impl Storage {
 
     /// 分别加载媒体库、设置和上次播放会话；损坏的单个文件回退为默认值。
     pub fn load(&self) -> Result<AppSnapshot, StorageError> {
+        let library = load_library(&self.root.join("library.json"))?;
         Ok(AppSnapshot {
-            library: load_or_default(&self.root.join("library.json"))?,
+            library: library.items,
+            categories: library.categories,
             settings: load_or_default(&self.root.join("settings.json"))?,
             playback: load_or_default(&self.root.join("session.json"))?,
+            displays: Vec::new(),
         })
     }
 
     /// 将快照分别持久化到三个可独立恢复的 JSON 文件。
     pub fn save(&self, snapshot: &AppSnapshot) -> Result<(), StorageError> {
         fs::create_dir_all(&self.root)?;
-        save_atomic(&self.root.join("library.json"), &snapshot.library)?;
+        save_atomic(
+            &self.root.join("library.json"),
+            &LibraryState {
+                items: snapshot.library.clone(),
+                categories: snapshot.categories.clone(),
+            },
+        )?;
         save_atomic(&self.root.join("settings.json"), &snapshot.settings)?;
         save_atomic(&self.root.join("session.json"), &snapshot.playback)?;
         Ok(())
+    }
+}
+
+fn load_library(path: &Path) -> Result<LibraryState, StorageError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(match serde_json::from_slice(&bytes) {
+            Ok(StoredLibrary::Current(library)) => library,
+            Ok(StoredLibrary::Legacy(items)) => LibraryState {
+                items,
+                categories: Vec::new(),
+            },
+            Err(_) => LibraryState::default(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LibraryState::default()),
+        Err(error) => Err(error.into()),
     }
 }
 

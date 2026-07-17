@@ -1,10 +1,11 @@
 //! 启动并通过命名管道控制随应用分发的 mpv。
 
-use crate::model::{AppSettings, MediaKind};
+use crate::model::{AppSettings, DisplayMode, MediaKind};
 use serde_json::json;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
@@ -14,6 +15,43 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+/// 表示 Windows 虚拟桌面中的播放器目标矩形。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScreenRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// 返回覆盖全部输入矩形的最小联合区域。
+pub fn union_regions(regions: &[ScreenRegion]) -> Option<ScreenRegion> {
+    regions.first()?;
+    let left = regions.iter().map(|region| region.x).min()?;
+    let top = regions.iter().map(|region| region.y).min()?;
+    let right = regions
+        .iter()
+        .map(|region| region.x.saturating_add(region.width))
+        .max()?;
+    let bottom = regions
+        .iter()
+        .map(|region| region.y.saturating_add(region.height))
+        .max()?;
+    Some(ScreenRegion {
+        x: left,
+        y: top,
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
+    })
+}
+
+/// 当最大播放位置差超过 100ms 时返回用于校准的最前位置。
+pub fn drift_correction_target(positions: &[f64]) -> Option<f64> {
+    let minimum = positions.iter().copied().reduce(f64::min)?;
+    let maximum = positions.iter().copied().reduce(f64::max)?;
+    (maximum - minimum > 0.1).then_some(maximum)
+}
 
 /// 构造不读取用户配置、无交互并创建独立窗口的 mpv 参数。
 pub fn build_mpv_arguments(
@@ -53,14 +91,60 @@ pub fn build_mpv_arguments(
             if settings.default_muted { "yes" } else { "no" }
         ),
         format!("--volume={}", settings.volume),
-        format!("--vf=fps={}", settings.frame_rate),
+        format!(
+            "--video-aspect-override={}",
+            settings.aspect_ratio.mpv_value(screen_width, screen_height)
+        ),
+        format!("--scale={}", settings.anti_aliasing.mpv_scale()),
     ];
+    if settings.frame_rate > 0 {
+        arguments.push(format!("--vf=fps={}", settings.frame_rate));
+    }
     arguments.extend(settings.scale_mode.mpv_arguments().map(str::to_owned));
     if kind == MediaKind::Image {
         arguments.push("--image-display-duration=inf".to_owned());
     }
     arguments.push(media_path.to_string_lossy().into_owned());
     arguments
+}
+
+/// 构造可通过 mpv IPC 实时应用的画面和声音设置命令。
+pub fn build_live_settings_commands(
+    settings: &AppSettings,
+    screen_width: i32,
+    screen_height: i32,
+) -> Vec<serde_json::Value> {
+    let [keep_aspect, panscan] = settings.scale_mode.mpv_arguments();
+    let panscan = panscan
+        .rsplit('=')
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    vec![
+        json!({ "command": ["set_property", "keepaspect", keep_aspect.ends_with("yes")] }),
+        json!({ "command": ["set_property", "panscan", panscan] }),
+        json!({
+            "command": [
+                "set_property",
+                "video-aspect-override",
+                settings.aspect_ratio.mpv_value(screen_width, screen_height)
+            ]
+        }),
+        json!({ "command": ["set_property", "scale", settings.anti_aliasing.mpv_scale()] }),
+        json!({
+            "command": [
+                "set_property",
+                "vf",
+                if settings.frame_rate == 0 {
+                    String::new()
+                } else {
+                    format!("fps={}", settings.frame_rate)
+                }
+            ]
+        }),
+        json!({ "command": ["set_property", "mute", settings.default_muted] }),
+        json!({ "command": ["set_property", "volume", settings.volume] }),
+    ]
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +168,7 @@ pub struct MpvPlayer {
     child: Option<Child>,
     pipe_name: Option<String>,
     player_window: Option<isize>,
+    screen_size: Option<(i32, i32)>,
     order_stop: Option<Arc<AtomicBool>>,
     order_thread: Option<JoinHandle<()>>,
 }
@@ -97,14 +182,39 @@ impl MpvPlayer {
         kind: MediaKind,
         settings: &AppSettings,
     ) -> Result<(), PlayerError> {
+        let (width, height) = primary_screen_size();
+        self.play_region(
+            binary,
+            media_path,
+            kind,
+            settings,
+            ScreenRegion {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+    }
+
+    /// 在指定虚拟桌面矩形内启动并嵌入新的 mpv 进程。
+    pub fn play_region(
+        &mut self,
+        binary: &Path,
+        media_path: &Path,
+        kind: MediaKind,
+        settings: &AppSettings,
+        region: ScreenRegion,
+    ) -> Result<(), PlayerError> {
         if !binary.is_file() {
             return Err(PlayerError::MissingBinary);
         }
         self.stop();
         let desktop = desktop_host_window().ok_or(PlayerError::MissingDesktopHost)?;
-        let (screen_width, screen_height) = primary_screen_size();
+        let screen_width = region.width;
+        let screen_height = region.height;
         let window_title = format!("wall-wallpaper-{}", uuid::Uuid::new_v4());
-        let pipe_name = format!(r"\\.\pipe\wall-mpv-{}", std::process::id());
+        let pipe_name = format!(r"\\.\pipe\wall-mpv-{}", uuid::Uuid::new_v4());
         let arguments = build_mpv_arguments(
             media_path,
             kind,
@@ -133,8 +243,7 @@ impl MpvPlayer {
                 return Err(error);
             }
         };
-        if let Err(error) = embed_player_window(player_window, desktop, screen_width, screen_height)
-        {
+        if let Err(error) = embed_player_window(player_window, desktop, region) {
             terminate_child(&mut child);
             return Err(error);
         }
@@ -146,6 +255,7 @@ impl MpvPlayer {
         self.child = Some(child);
         self.pipe_name = Some(pipe_name);
         self.player_window = Some(player_window);
+        self.screen_size = Some((screen_width, screen_height));
         Ok(())
     }
 
@@ -178,6 +288,17 @@ impl MpvPlayer {
         self.send(json!({ "command": ["set_property", "panscan", panscan] }))
     }
 
+    /// 将无需重启播放器的设置通过 IPC 应用到当前 mpv。
+    pub fn apply_settings(&self, settings: &AppSettings) -> Result<(), PlayerError> {
+        let (width, height) = self
+            .screen_size
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "mpv 尚未运行"))?;
+        for command in build_live_settings_commands(settings, width, height) {
+            self.send(command)?;
+        }
+        Ok(())
+    }
+
     /// 停止当前 mpv 进程；管道不可用时直接终止子进程。
     pub fn stop(&mut self) {
         if let Some(stop) = self.order_stop.take() {
@@ -199,6 +320,7 @@ impl MpvPlayer {
         self.child = None;
         self.pipe_name = None;
         self.player_window = None;
+        self.screen_size = None;
     }
 
     fn send(&self, command: serde_json::Value) -> Result<(), PlayerError> {
@@ -221,9 +343,520 @@ impl MpvPlayer {
             }
         }
     }
+
+    fn time_position(&self) -> Result<Option<f64>, PlayerError> {
+        let response = self.request(json!({
+            "command": ["get_property", "time-pos"],
+            "request_id": 1
+        }))?;
+        Ok(response.get("data").and_then(serde_json::Value::as_f64))
+    }
+
+    fn has_exited(&mut self) -> Result<bool, PlayerError> {
+        match self.child.as_mut() {
+            Some(child) => Ok(child.try_wait()?.is_some()),
+            None => Ok(true),
+        }
+    }
+
+    fn request(&self, command: serde_json::Value) -> Result<serde_json::Value, PlayerError> {
+        let pipe_name = self
+            .pipe_name
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "mpv 尚未运行"))?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pipe = loop {
+            match OpenOptions::new().read(true).write(true).open(pipe_name) {
+                Ok(pipe) => break pipe,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(40)),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        serde_json::to_writer(&mut pipe, &command).map_err(std::io::Error::other)?;
+        pipe.write_all(b"\n")?;
+        read_ipc_response(&mut pipe, 1, Instant::now() + Duration::from_secs(2))
+    }
+}
+
+#[cfg(windows)]
+fn read_ipc_response(
+    pipe: &mut File,
+    request_id: i64,
+    deadline: Instant,
+) -> Result<serde_json::Value, PlayerError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+
+    let handle = HANDLE(pipe.as_raw_handle());
+    let mut pending = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "mpv IPC 响应超时").into(),
+            );
+        }
+        let mut available = 0;
+        unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available), None) }
+            .map_err(|problem| std::io::Error::other(problem.to_string()))?;
+        if available == 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let start = pending.len();
+        pending.resize(start + available as usize, 0);
+        pipe.read_exact(&mut pending[start..])?;
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=end).collect::<Vec<_>>();
+            let value: serde_json::Value =
+                serde_json::from_slice(&line).map_err(std::io::Error::other)?;
+            if value.get("request_id").and_then(serde_json::Value::as_i64) == Some(request_id) {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_ipc_response(
+    pipe: &mut File,
+    request_id: i64,
+    _deadline: Instant,
+) -> Result<serde_json::Value, PlayerError> {
+    use std::io::{BufRead, BufReader};
+
+    let mut reader = BufReader::new(pipe);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mpv IPC 未返回响应",
+            )
+            .into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(std::io::Error::other)?;
+        if value.get("request_id").and_then(serde_json::Value::as_i64) == Some(request_id) {
+            return Ok(value);
+        }
+    }
 }
 
 impl Drop for MpvPlayer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct PlayerGroup {
+    media_id: String,
+    binary: PathBuf,
+    media_path: PathBuf,
+    kind: MediaKind,
+    settings: AppSettings,
+    mode: DisplayMode,
+    display_ids: Vec<String>,
+    regions: Vec<ScreenRegion>,
+    players: Vec<MpvPlayer>,
+}
+
+/// 管理独立显示器和联动显示器组中的全部 mpv 实例。
+#[derive(Default)]
+pub struct MpvPlayerManager {
+    groups: HashMap<String, PlayerGroup>,
+}
+
+impl MpvPlayerManager {
+    /// 判断指定显示目标当前是否有受管播放器组。
+    pub fn has_target(&self, target_id: &str) -> bool {
+        self.groups.contains_key(target_id)
+    }
+
+    /// 兼容单显示器调用，并停止此前全部播放器。
+    pub fn play(
+        &mut self,
+        media_id: &str,
+        binary: &Path,
+        media_path: &Path,
+        kind: MediaKind,
+        settings: &AppSettings,
+    ) -> Result<(), PlayerError> {
+        self.stop();
+        let (width, height) = primary_screen_size();
+        self.play_target(
+            "display:primary",
+            media_id,
+            binary,
+            media_path,
+            kind,
+            settings,
+            DisplayMode::Independent,
+            &["primary".to_owned()],
+            &[ScreenRegion {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        )
+    }
+
+    /// 在一个独立目标、复制组或铺展组中播放指定媒体。
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_target(
+        &mut self,
+        target_id: &str,
+        media_id: &str,
+        binary: &Path,
+        media_path: &Path,
+        kind: MediaKind,
+        settings: &AppSettings,
+        mode: DisplayMode,
+        display_ids: &[String],
+        regions: &[ScreenRegion],
+    ) -> Result<(), PlayerError> {
+        self.play_target_configured(
+            target_id,
+            media_id,
+            binary,
+            media_path,
+            kind,
+            settings,
+            mode,
+            display_ids,
+            regions,
+            false,
+            settings.default_muted,
+            settings.volume,
+        )
+    }
+
+    /// 完成初始暂停与声音配置后，再原子替换占用相同显示器的旧播放器组。
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_target_configured(
+        &mut self,
+        target_id: &str,
+        media_id: &str,
+        binary: &Path,
+        media_path: &Path,
+        kind: MediaKind,
+        settings: &AppSettings,
+        mode: DisplayMode,
+        display_ids: &[String],
+        regions: &[ScreenRegion],
+        paused: bool,
+        muted: bool,
+        volume: u8,
+    ) -> Result<(), PlayerError> {
+        let target_regions = match mode {
+            DisplayMode::Span => {
+                vec![union_regions(regions).ok_or(PlayerError::MissingDesktopHost)?]
+            }
+            DisplayMode::Independent => {
+                vec![*regions.first().ok_or(PlayerError::MissingDesktopHost)?]
+            }
+            DisplayMode::Clone => regions.to_vec(),
+        };
+        let mut players: Vec<MpvPlayer> = Vec::with_capacity(target_regions.len());
+        for (index, region) in target_regions.iter().copied().enumerate() {
+            let mut player = MpvPlayer::default();
+            let mut player_settings = settings.clone();
+            if mode == DisplayMode::Clone && index > 0 {
+                player_settings.default_muted = true;
+            }
+            if let Err(error) =
+                player.play_region(binary, media_path, kind, &player_settings, region)
+            {
+                for started in &mut players {
+                    started.stop();
+                }
+                return Err(error);
+            }
+            players.push(player);
+        }
+        if mode == DisplayMode::Clone && players.len() > 1 {
+            for player in &players {
+                player.set_paused(true)?;
+                player.send(json!({ "command": ["set_property", "time-pos", 0] }))?;
+            }
+            for player in &players {
+                player.set_paused(false)?;
+            }
+        }
+        for (index, player) in players.iter().enumerate() {
+            player.set_paused(paused)?;
+            player.set_muted(muted || index > 0)?;
+            player.set_volume(volume)?;
+        }
+        let replaced = self
+            .groups
+            .iter()
+            .filter(|(existing_id, group)| {
+                existing_id.as_str() == target_id
+                    || group
+                        .display_ids
+                        .iter()
+                        .any(|display_id| display_ids.contains(display_id))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in replaced {
+            if let Some(mut group) = self.groups.remove(&key) {
+                for player in &mut group.players {
+                    player.stop();
+                }
+            }
+        }
+        self.groups.insert(
+            target_id.to_owned(),
+            PlayerGroup {
+                media_id: media_id.to_owned(),
+                binary: binary.to_path_buf(),
+                media_path: media_path.to_path_buf(),
+                kind,
+                settings: settings.clone(),
+                mode,
+                display_ids: display_ids.to_vec(),
+                regions: regions.to_vec(),
+                players,
+            },
+        );
+        Ok(())
+    }
+
+    /// 暂停或继续全部显示目标。
+    pub fn set_paused(&self, paused: bool) -> Result<(), PlayerError> {
+        for group in self.groups.values() {
+            for player in &group.players {
+                player.set_paused(paused)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 暂停或继续一个显示目标。
+    pub fn set_target_paused(&self, target_id: &str, paused: bool) -> Result<(), PlayerError> {
+        let group = self
+            .groups
+            .get(target_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
+        for player in &group.players {
+            player.set_paused(paused)?;
+        }
+        Ok(())
+    }
+
+    /// 设置每个显示目标的单一音源静音状态。
+    pub fn set_muted(&self, muted: bool) -> Result<(), PlayerError> {
+        for group in self.groups.values() {
+            for (index, player) in group.players.iter().enumerate() {
+                player.set_muted(muted || index > 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 设置一个显示目标的单一音源静音状态。
+    pub fn set_target_muted(&self, target_id: &str, muted: bool) -> Result<(), PlayerError> {
+        let group = self
+            .groups
+            .get(target_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
+        for (index, player) in group.players.iter().enumerate() {
+            player.set_muted(muted || index > 0)?;
+        }
+        Ok(())
+    }
+
+    /// 设置一个显示目标的音量。
+    pub fn set_target_volume(&self, target_id: &str, volume: u8) -> Result<(), PlayerError> {
+        let group = self
+            .groups
+            .get(target_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "显示目标不存在"))?;
+        for player in &group.players {
+            player.set_volume(volume)?;
+        }
+        Ok(())
+    }
+
+    /// 设置全部显示目标的音量。
+    pub fn set_volume(&self, volume: u8) -> Result<(), PlayerError> {
+        for group in self.groups.values() {
+            for player in &group.players {
+                player.set_volume(volume)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 动态更新全部显示目标的缩放方式。
+    pub fn set_scale_mode(&self, settings: &AppSettings) -> Result<(), PlayerError> {
+        for group in self.groups.values() {
+            for player in &group.players {
+                player.set_scale_mode(settings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 动态更新全部无需重启的播放器设置。
+    pub fn apply_settings(&mut self, settings: &AppSettings) -> Result<(), PlayerError> {
+        for group in self.groups.values_mut() {
+            group.settings = settings.clone();
+            for (index, player) in group.players.iter().enumerate() {
+                let mut player_settings = settings.clone();
+                if group.mode == DisplayMode::Clone && index > 0 {
+                    player_settings.default_muted = true;
+                }
+                player.apply_settings(&player_settings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 更新使用指定壁纸的显示目标；硬件解码变化时仅重启相关播放器组。
+    pub fn apply_media_settings(
+        &mut self,
+        media_id: &str,
+        settings: &AppSettings,
+    ) -> Result<(), PlayerError> {
+        let keys = self
+            .groups
+            .iter()
+            .filter(|(_, group)| group.media_id == media_id)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(mut group) = self.groups.remove(&key) else {
+                continue;
+            };
+            if group.settings.hardware_decoding != settings.hardware_decoding {
+                let restart = self.play_target(
+                    &key,
+                    media_id,
+                    &group.binary,
+                    &group.media_path,
+                    group.kind,
+                    settings,
+                    group.mode,
+                    &group.display_ids,
+                    &group.regions,
+                );
+                if let Err(problem) = restart {
+                    self.groups.insert(key, group);
+                    return Err(problem);
+                }
+                for player in &mut group.players {
+                    player.stop();
+                }
+            } else {
+                let previous_settings = group.settings.clone();
+                for (index, player) in group.players.iter().enumerate() {
+                    let mut player_settings = settings.clone();
+                    if group.mode == DisplayMode::Clone && index > 0 {
+                        player_settings.default_muted = true;
+                    }
+                    if let Err(problem) = player.apply_settings(&player_settings) {
+                        for (rollback_index, rollback_player) in group.players.iter().enumerate() {
+                            let mut rollback_settings = previous_settings.clone();
+                            if group.mode == DisplayMode::Clone && rollback_index > 0 {
+                                rollback_settings.default_muted = true;
+                            }
+                            let _ = rollback_player.apply_settings(&rollback_settings);
+                        }
+                        self.groups.insert(key, group);
+                        return Err(problem);
+                    }
+                }
+                group.settings = settings.clone();
+                self.groups.insert(key, group);
+            }
+        }
+        Ok(())
+    }
+
+    /// 校准复制组中超过 100ms 的播放漂移。
+    pub fn sync_clone_groups(&self) -> Result<(), PlayerError> {
+        for group in self
+            .groups
+            .values()
+            .filter(|group| group.mode == DisplayMode::Clone && group.players.len() > 1)
+        {
+            let positions = group
+                .players
+                .iter()
+                .map(MpvPlayer::time_position)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if let Some(target) = drift_correction_target(&positions) {
+                for player in &group.players {
+                    player.send(json!({ "command": ["set_property", "time-pos", target] }))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 移除任一 mpv 子进程已经退出的显示目标并返回其标识。
+    pub fn take_exited_targets(&mut self) -> Result<Vec<String>, PlayerError> {
+        let mut exited = Vec::new();
+        for (target_id, group) in &mut self.groups {
+            let mut group_exited = false;
+            for player in &mut group.players {
+                group_exited |= player.has_exited()?;
+            }
+            if group_exited {
+                exited.push(target_id.clone());
+            }
+        }
+        for target_id in &exited {
+            self.stop_target(target_id);
+        }
+        Ok(exited)
+    }
+
+    /// 停止使用指定壁纸的全部显示目标。
+    pub fn stop_media(&mut self, media_id: &str) {
+        let keys = self
+            .groups
+            .iter()
+            .filter(|(_, group)| group.media_id == media_id)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(mut group) = self.groups.remove(&key) {
+                for player in &mut group.players {
+                    player.stop();
+                }
+            }
+        }
+    }
+
+    /// 停止并移除一个显示目标。
+    pub fn stop_target(&mut self, target_id: &str) {
+        if let Some(mut group) = self.groups.remove(target_id) {
+            for player in &mut group.players {
+                player.stop();
+            }
+        }
+    }
+
+    /// 停止并清空全部显示目标。
+    pub fn stop(&mut self) {
+        for group in self.groups.values_mut() {
+            for player in &mut group.players {
+                player.stop();
+            }
+        }
+        self.groups.clear();
+    }
+}
+
+impl Drop for MpvPlayerManager {
     fn drop(&mut self) {
         self.stop();
     }
@@ -362,11 +995,11 @@ fn wait_for_player_window(_title: &str, _child: &mut Child) -> Result<isize, Pla
 fn embed_player_window(
     player_window: isize,
     desktop: DesktopHost,
-    width: i32,
-    height: i32,
+    region: ScreenRegion,
 ) -> Result<(), PlayerError> {
     use core::ffi::c_void;
-    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::Foundation::{COLORREF, HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GWL_STYLE, GetParent, GetWindowLongPtrW, LWA_ALPHA, SET_WINDOW_POS_FLAGS,
         SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, WS_CHILD,
@@ -396,14 +1029,21 @@ fn embed_player_window(
         if parent != host {
             return Err(PlayerError::Embedding("SetParent 未生效".to_owned()));
         }
+        let mut origin = POINT {
+            x: region.x,
+            y: region.y,
+        };
+        ScreenToClient(host, &mut origin)
+            .ok()
+            .map_err(|error| PlayerError::Embedding(error.to_string()))?;
         let insert_after = desktop.raised.then_some(shell_view);
         SetWindowPos(
             player,
             insert_after,
-            0,
-            0,
-            width,
-            height,
+            origin.x,
+            origin.y,
+            region.width,
+            region.height,
             SET_WINDOW_POS_FLAGS(embedding_flags(desktop.raised)),
         )
         .map_err(|error| PlayerError::Embedding(error.to_string()))?;
@@ -415,8 +1055,7 @@ fn embed_player_window(
 fn embed_player_window(
     _player_window: isize,
     _desktop: DesktopHost,
-    _width: i32,
-    _height: i32,
+    _region: ScreenRegion,
 ) -> Result<(), PlayerError> {
     Err(PlayerError::MissingDesktopHost)
 }
