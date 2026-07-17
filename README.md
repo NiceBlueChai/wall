@@ -13,6 +13,10 @@
 Wall is a free, open-source dynamic wallpaper app for Windows 10/11 x64. It only reads local videos and images
 selected by the user and provides no accounts, marketplace, cloud sync, telemetry, or automatic updates.
 
+<p align="center">
+    <img src="docs/images/wall-library.png" width="960" alt="Wall wallpaper library">
+</p>
+
 ## Features
 
 - Local video and image wallpapers with user categories and batch management.
@@ -45,7 +49,7 @@ Microsoft Edge WebView2 Runtime if it is missing. The app and wallpaper playback
 
 - Wall does not upload media, modify source files, or send telemetry.
 - The library, settings, and playback session are stored in the current user's application data directory.
-- Thumbnails and logs are stored in the application cache directory.
+- Runtime logs are stored in the current user's application configuration directory and can be opened from Settings.
 - The runtime performs no update checks or HTTP requests.
 
 ## Development
@@ -79,6 +83,25 @@ restores the original application data by SHA-256:
 powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
     -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
     -VideoPath C:\path\to\test.mp4
+```
+
+To exercise the saved-session startup path, keep the existing application data and point `VideoPath` to the media
+being restored by the active session:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
+    -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
+    -VideoPath C:\path\to\active-wallpaper.mp4 `
+    -UseExistingData
+```
+
+If verification is interrupted, the script preserves the original data backup and refuses another normal run. Close
+all Wall processes, then recover it with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
+    -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
+    -RecoverInterruptedRun
 ```
 
 ## Project Structure

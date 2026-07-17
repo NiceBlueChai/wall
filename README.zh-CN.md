@@ -13,6 +13,10 @@
 Wall 是面向 Windows 10/11 x64 的免费开源动态壁纸工具。它只读取用户选择的本地视频和图片，
 不提供账号、商城、云同步、遥测或自动更新。
 
+<p align="center">
+    <img src="docs/images/wall-library.png" width="960" alt="Wall 壁纸库界面">
+</p>
+
 ## 功能
 
 - 本地视频与图片壁纸，支持用户分类和批量管理。
@@ -44,7 +48,7 @@ WebView2 Runtime。应用和壁纸播放本身不需要联网。
 
 - Wall 不上传媒体，不修改用户原文件，也不发送遥测。
 - 壁纸库、设置和播放会话保存在当前用户的应用数据目录。
-- 缩略图与日志保存在应用缓存目录，可从设置页打开日志目录。
+- 运行日志保存在当前用户的应用配置目录，可从设置页打开日志目录。
 - 运行时不检查更新，不发起 HTTP 请求。
 
 ## 开发
@@ -77,6 +81,23 @@ powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1
 powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
     -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
     -VideoPath C:\path\to\test.mp4
+```
+
+复现“恢复上次壁纸”的启动路径时，保留当前应用数据，并让 `VideoPath` 指向会话中正在恢复的媒体：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
+    -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
+    -VideoPath C:\path\to\active-wallpaper.mp4 `
+    -UseExistingData
+```
+
+如果验证被强制中断，脚本会保留原数据备份并拒绝继续普通测试。关闭所有 Wall 进程后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-portable.ps1 `
+    -WallDirectory release\Wall-v1.0.0-windows-x64-portable `
+    -RecoverInterruptedRun
 ```
 
 ## 项目结构
