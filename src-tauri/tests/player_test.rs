@@ -77,7 +77,7 @@ fn live_visual_commands_clear_the_fps_filter_for_source_rate() {
         ..Default::default()
     };
 
-    let commands = build_live_settings_commands(&settings, 2560, 1440);
+    let commands = build_live_settings_commands(&settings, 2560, 1440, MediaKind::Video);
 
     assert!(commands.contains(&serde_json::json!({
         "command": ["set_property", "video-aspect-override", "2560:1440"]
@@ -85,6 +85,16 @@ fn live_visual_commands_clear_the_fps_filter_for_source_rate() {
     assert!(commands.contains(&serde_json::json!({
         "command": ["set_property", "scale", "bilinear"]
     })));
+    assert!(commands.contains(&serde_json::json!({
+        "command": ["set_property", "vf", ""]
+    })));
+}
+
+#[test]
+fn image_live_settings_clear_the_video_fps_filter() {
+    let commands =
+        build_live_settings_commands(&AppSettings::default(), 2560, 1440, MediaKind::Image);
+
     assert!(commands.contains(&serde_json::json!({
         "command": ["set_property", "vf", ""]
     })));
@@ -146,4 +156,9 @@ fn image_and_stretch_arguments_are_explicit() {
     assert!(arguments.contains(&"--image-display-duration=inf".to_owned()));
     assert!(arguments.contains(&"--keepaspect=no".to_owned()));
     assert!(arguments.contains(&"--hwdec=no".to_owned()));
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.starts_with("--vf=fps="))
+    );
 }

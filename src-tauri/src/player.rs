@@ -97,7 +97,7 @@ pub fn build_mpv_arguments(
         ),
         format!("--scale={}", settings.anti_aliasing.mpv_scale()),
     ];
-    if settings.frame_rate > 0 {
+    if kind == MediaKind::Video && settings.frame_rate > 0 {
         arguments.push(format!("--vf=fps={}", settings.frame_rate));
     }
     arguments.extend(settings.scale_mode.mpv_arguments().map(str::to_owned));
@@ -113,6 +113,7 @@ pub fn build_live_settings_commands(
     settings: &AppSettings,
     screen_width: i32,
     screen_height: i32,
+    kind: MediaKind,
 ) -> Vec<serde_json::Value> {
     let [keep_aspect, panscan] = settings.scale_mode.mpv_arguments();
     let panscan = panscan
@@ -135,7 +136,7 @@ pub fn build_live_settings_commands(
             "command": [
                 "set_property",
                 "vf",
-                if settings.frame_rate == 0 {
+                if kind == MediaKind::Image || settings.frame_rate == 0 {
                     String::new()
                 } else {
                     format!("fps={}", settings.frame_rate)
@@ -325,11 +326,15 @@ impl MpvPlayer {
     }
 
     /// 将无需重启播放器的设置通过 IPC 应用到当前 mpv。
-    pub fn apply_settings(&self, settings: &AppSettings) -> Result<(), PlayerError> {
+    pub fn apply_settings(
+        &self,
+        settings: &AppSettings,
+        kind: MediaKind,
+    ) -> Result<(), PlayerError> {
         let (width, height) = self
             .screen_size
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "mpv 尚未运行"))?;
-        for command in build_live_settings_commands(settings, width, height) {
+        for command in build_live_settings_commands(settings, width, height, kind) {
             self.send(command)?;
         }
         Ok(())
@@ -677,7 +682,7 @@ impl MpvPlayerManager {
                 if mode == DisplayMode::Clone && index > 0 {
                     player_settings.default_muted = true;
                 }
-                player.apply_settings(&player_settings)?;
+                player.apply_settings(&player_settings, kind)?;
             }
             if mode == DisplayMode::Clone && group.players.len() > 1 {
                 for player in &group.players {
@@ -708,7 +713,7 @@ impl MpvPlayerManager {
                 if group.mode == DisplayMode::Clone && index > 0 {
                     player_settings.default_muted = true;
                 }
-                if let Err(rollback) = player.apply_settings(&player_settings) {
+                if let Err(rollback) = player.apply_settings(&player_settings, group.kind) {
                     rollback_errors.push(format!(
                         "实例 {} 恢复设置失败：{rollback}",
                         index.saturating_add(1)
@@ -976,7 +981,7 @@ impl MpvPlayerManager {
                 if group.mode == DisplayMode::Clone && index > 0 {
                     player_settings.default_muted = true;
                 }
-                player.apply_settings(&player_settings)?;
+                player.apply_settings(&player_settings, group.kind)?;
             }
             group.settings = settings.clone();
         }
@@ -1025,13 +1030,13 @@ impl MpvPlayerManager {
                     if group.mode == DisplayMode::Clone && index > 0 {
                         player_settings.default_muted = true;
                     }
-                    if let Err(problem) = player.apply_settings(&player_settings) {
+                    if let Err(problem) = player.apply_settings(&player_settings, group.kind) {
                         for (rollback_index, rollback_player) in group.players.iter().enumerate() {
                             let mut rollback_settings = previous_settings.clone();
                             if group.mode == DisplayMode::Clone && rollback_index > 0 {
                                 rollback_settings.default_muted = true;
                             }
-                            let _ = rollback_player.apply_settings(&rollback_settings);
+                            let _ = rollback_player.apply_settings(&rollback_settings, group.kind);
                         }
                         self.groups.insert(key, group);
                         return Err(problem);
@@ -1403,7 +1408,7 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        let group = PlayerGroup {
+        let mut group = PlayerGroup {
             media_id: "old".to_owned(),
             binary: PathBuf::from("mpv.exe"),
             media_path: PathBuf::from("old.mp4"),
@@ -1499,6 +1504,18 @@ mod tests {
             DisplayMode::Independent,
             &["DISPLAY1".to_owned()],
             &[ScreenRegion { x: 10, ..region }],
+            1,
+        ));
+
+        group.kind = MediaKind::Image;
+        assert!(can_hot_switch(
+            &group,
+            Path::new("mpv.exe"),
+            MediaKind::Image,
+            &AppSettings::default(),
+            DisplayMode::Independent,
+            &["DISPLAY1".to_owned()],
+            &[region],
             1,
         ));
     }

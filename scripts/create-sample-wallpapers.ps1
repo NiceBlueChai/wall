@@ -1,4 +1,4 @@
-<# Generates redistributable MP4 test patterns for the portable Wall package. #>
+<# Creates redistributable video and image samples for the portable Wall package. #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -28,6 +28,11 @@ foreach ($Sample in $Samples) {
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to generate sample wallpaper: $($Sample.Name)"
     }
+}
+
+$ImageSource = Join-Path (Split-Path -Parent $PSScriptRoot) "samples\images"
+foreach ($Image in Get-ChildItem -LiteralPath $ImageSource -Filter "*.png" -File) {
+    Copy-Item -LiteralPath $Image.FullName -Destination $DestinationPath
 }
 
 Write-Host "Sample wallpapers created in $DestinationPath"

@@ -1,10 +1,14 @@
-<# Runs a no-mouse native smoke test and restores the user's Wall data byte-for-byte. #>
+<# Runs a no-mouse native media smoke test and restores the user's Wall data byte-for-byte. #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$WallDirectory,
 
-    [string]$VideoPath,
+    [Alias("VideoPath")]
+    [string]$MediaPath,
+
+    [ValidateSet("video", "image")]
+    [string]$MediaKind,
 
     [switch]$UseExistingData,
 
@@ -46,10 +50,24 @@ if ($RecoverInterruptedRun) {
 if ($InterruptedBackups.Count -gt 0) {
     throw "An interrupted verification backup exists; run this script with -RecoverInterruptedRun first."
 }
-if (-not $VideoPath) {
-    throw "VideoPath is required unless -RecoverInterruptedRun is used."
+if (-not $MediaPath) {
+    throw "MediaPath is required unless -RecoverInterruptedRun is used."
 }
-$VideoPath = (Resolve-Path -LiteralPath $VideoPath).Path
+$MediaPath = (Resolve-Path -LiteralPath $MediaPath).Path
+$Extension = [IO.Path]::GetExtension($MediaPath).TrimStart('.').ToLowerInvariant()
+if (@("jpg", "jpeg", "png", "webp", "bmp", "gif") -contains $Extension) {
+    $DetectedKind = "image"
+} elseif (@("mp4", "mkv", "webm", "mov", "avi") -contains $Extension) {
+    $DetectedKind = "video"
+} else {
+    throw "Unable to infer the media kind from .$Extension."
+}
+if (-not $MediaKind) {
+    $MediaKind = $DetectedKind
+} elseif ($MediaKind -ne $DetectedKind) {
+    throw "MediaKind '$MediaKind' does not match .$Extension media."
+}
+$MediaId = "portable-verification-$MediaKind"
 $WallExecutable = Join-Path $WallDirectory "Wall.exe"
 if (-not (Test-Path -LiteralPath $WallExecutable)) {
     throw "Wall.exe is missing from $WallDirectory."
@@ -91,11 +109,11 @@ try {
         New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
         $Library = @(
             [ordered]@{
-                id = "portable-verification-video"
-                name = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
-                path = $VideoPath
-                kind = "video"
-                format = "MP4"
+                id = $MediaId
+                name = [IO.Path]::GetFileNameWithoutExtension($MediaPath)
+                path = $MediaPath
+                kind = $MediaKind
+                format = $Extension.ToUpperInvariant()
                 width = $null
                 height = $null
                 durationSeconds = $null
@@ -104,7 +122,7 @@ try {
             }
         )
         $Session = [ordered]@{
-            activeId = "portable-verification-video"
+            activeId = $MediaId
             status = "playing"
             muted = $true
             volume = 0
@@ -151,8 +169,11 @@ try {
     }
 
     $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($MpvProcess.Id)").CommandLine
-    if ($CommandLine -notmatch [regex]::Escape($VideoPath)) {
-        throw "mpv did not open the requested test video."
+    if ($CommandLine -notmatch [regex]::Escape($MediaPath)) {
+        throw "mpv did not open the requested test media."
+    }
+    if ($MediaKind -eq "image" -and $CommandLine -notmatch "--image-display-duration=inf") {
+        throw "mpv did not keep the requested image visible indefinitely."
     }
     $NativeScript = Join-Path $PSScriptRoot "verify-wallpaper-host.ps1"
     $NativeArguments = @(
@@ -181,7 +202,8 @@ try {
         throw "Wall.exe is not a Windows GUI executable. Subsystem=$Subsystem"
     }
     [ordered]@{
-        video = $VideoPath
+        media = $MediaPath
+        mediaKind = $MediaKind
         mpvCommandLine = $CommandLine
         peSubsystem = $Subsystem
         nativeVerification = ($NativeResult | ConvertFrom-Json)
