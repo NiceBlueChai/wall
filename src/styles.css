@@ -40,6 +40,9 @@ select {
 button {
     color: inherit;
 }
+input {
+    user-select: text;
+}
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -51,6 +54,7 @@ select:focus-visible,
     width: 100%;
     height: 100%;
     background: var(--surface-canvas);
+    user-select: none;
 }
 .titlebar {
     height: 48px;
@@ -59,7 +63,6 @@ select:focus-visible,
     justify-content: space-between;
     background: var(--surface-sidebar);
     border-bottom: 1px solid #171a2b;
-    user-select: none;
 }
 .brand {
     display: flex;

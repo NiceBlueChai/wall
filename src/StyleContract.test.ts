@@ -23,4 +23,11 @@ describe('Figma style contract', () => {
         expect(css).toContain('.danger { background: var(--danger);');
         expect(css).toContain('.button-medium { min-height: 40px; padding: 0 16px;');
     });
+
+    it('prevents text selection outside inputs', () => {
+        expect(css).toContain(
+            '.app-window { width: 100%; height: 100%; background: var(--surface-canvas); user-select: none;',
+        );
+        expect(css).toContain('input { user-select: text;');
+    });
 });
