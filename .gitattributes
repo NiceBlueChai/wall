@@ -19,4 +19,5 @@
 *.jpg binary
 *.mp4 binary
 *.png binary
+*.rgba binary
 *.webp binary

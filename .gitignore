@@ -1,5 +1,6 @@
 node_modules/
 .codex/
+.superpowers/
 dist/
 target/
 src-tauri/target/
