@@ -113,6 +113,28 @@ describe('App window controls', () => {
         expect(wallStore.activeCategoryId).toBe('nature');
         expect(wallStore.batchMode).toBe(true);
     });
+
+    it('suppresses the browser context menu outside editable controls', async () => {
+        const router = createRouter({
+            history: createMemoryHistory(),
+            routes: [
+                { path: '/', name: 'library', component: { template: '<div />' } },
+                { path: '/settings/:section', name: 'settings', component: { template: '<div />' } },
+            ],
+        });
+        await router.push('/');
+        await router.isReady();
+        const wrapper = mount(App, { global: { plugins: [router] } });
+
+        const shellEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+        wrapper.get('.sidebar').element.dispatchEvent(shellEvent);
+        expect(shellEvent.defaultPrevented).toBe(true);
+
+        await wrapper.get('[aria-label="添加分类"]').trigger('click');
+        const inputEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+        wrapper.get('.category-dialog input').element.dispatchEvent(inputEvent);
+        expect(inputEvent.defaultPrevented).toBe(false);
+    });
 });
 
 function media(id: string, categoryIds: string[]) {

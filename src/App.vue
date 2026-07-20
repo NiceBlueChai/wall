@@ -42,6 +42,12 @@ onMounted(async () => {
 });
 onUnmounted(() => unlisten());
 
+function preventBrowserContextMenu(event: MouseEvent) {
+    const target = event.target;
+    if (target instanceof Element && target.closest('input, textarea, [contenteditable="true"]')) return;
+    event.preventDefault();
+}
+
 async function windowAction(action: 'minimize' | 'maximize' | 'close') {
     windowError.value = '';
     try {
@@ -102,7 +108,7 @@ async function submitCategoryDialog() {
 </script>
 
 <template>
-    <div class="app-window">
+    <div class="app-window" @contextmenu="preventBrowserContextMenu">
         <header class="titlebar" data-tauri-drag-region>
             <div class="brand" data-tauri-drag-region>
                 <WallIcon name="app" :size="20" />
