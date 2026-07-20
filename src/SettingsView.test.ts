@@ -86,6 +86,11 @@ describe('SettingsView', () => {
 
         expect(wrapper.text()).toContain('画面');
         expect(wrapper.text()).toContain('声音');
+        const scaleModeButtons = wrapper.findAll('.segmented.compact button');
+        expect(scaleModeButtons.map((button) => button.text())).toEqual(['填充', '适应', '拉伸']);
+        await scaleModeButtons[1].trigger('click');
+        await flushPromises();
+        expect(mocks.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ scaleMode: 'contain' }));
         expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('21:9');
         expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('高质量');
         expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('源帧率');

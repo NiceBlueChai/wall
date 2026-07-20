@@ -101,6 +101,11 @@ describe('DetailView', () => {
         expect(wrapper.text()).not.toContain('静态图片');
         expect(wrapper.get('.media-preview video').attributes('controls')).toBeUndefined();
         expect(wrapper.get('input[type="range"]').attributes('style')).toContain('--range-progress: 0%');
+        expect(wrapper.findAll('.detail-setting-field .segmented button').map((button) => button.text())).toEqual([
+            '填充',
+            '适应',
+            '拉伸',
+        ]);
 
         await wrapper.get('.page-heading .primary').trigger('click');
         await flushPromises();

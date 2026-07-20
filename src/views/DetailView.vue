@@ -17,12 +17,17 @@ import {
 } from '../api';
 import { wallStore } from '../store';
 import WallIcon from '../components/WallIcon.vue';
-import type { AppSettings, ScaleMode, WallpaperSettings } from '../types';
+import type { AppSettings, WallpaperSettings } from '../types';
 
 const route = useRoute();
 const router = useRouter();
 const errorMessage = ref('');
 const categoryEditorOpen = ref(false);
+const scaleModes = [
+    { value: 'cover', label: '填充' },
+    { value: 'contain', label: '适应' },
+    { value: 'stretch', label: '拉伸' },
+] as const;
 const item = computed(() => wallStore.snapshot.library.find((entry) => entry.id === route.params.id) ?? null);
 const activeAssignments = computed(() =>
     (wallStore.snapshot.playback.displayAssignments ?? []).filter(
@@ -231,12 +236,12 @@ async function stopCurrentTargets() {
                 <label>缩放方式</label>
                 <div class="segmented">
                     <button
-                        v-for="mode in ['cover', 'contain', 'stretch'] as ScaleMode[]"
-                        :key="mode"
-                        :class="{ active: effectiveSettings.scaleMode === mode }"
-                        @click="changeOverride('scaleMode', mode)"
+                        v-for="mode in scaleModes"
+                        :key="mode.value"
+                        :class="{ active: effectiveSettings.scaleMode === mode.value }"
+                        @click="changeOverride('scaleMode', mode.value)"
                     >
-                        {{ mode[0].toUpperCase() + mode.slice(1) }}
+                        {{ mode.label }}
                     </button>
                 </div>
             </div>

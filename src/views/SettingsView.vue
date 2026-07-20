@@ -17,6 +17,11 @@ const tabs = [
     ['performance', '性能'],
     ['about', '关于'],
 ] as const;
+const scaleModes = [
+    { value: 'cover', label: '填充' },
+    { value: 'contain', label: '适应' },
+    { value: 'stretch', label: '拉伸' },
+] as const;
 
 async function change<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     errorMessage.value = '';
@@ -108,12 +113,12 @@ function readError(error: unknown): string {
                 <div><strong>缩放方式</strong><small>默认等比例填满并居中裁切</small></div>
                 <div class="segmented compact">
                     <button
-                        v-for="mode in ['cover', 'contain', 'stretch'] as const"
-                        :key="mode"
-                        :class="{ active: settings.scaleMode === mode }"
-                        @click="change('scaleMode', mode)"
+                        v-for="mode in scaleModes"
+                        :key="mode.value"
+                        :class="{ active: settings.scaleMode === mode.value }"
+                        @click="change('scaleMode', mode.value)"
                     >
-                        {{ mode[0].toUpperCase() + mode.slice(1) }}
+                        {{ mode.label }}
                     </button>
                 </div>
             </div>
