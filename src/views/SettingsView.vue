@@ -9,6 +9,8 @@ import type { AppSettings } from '../types';
 
 const route = useRoute();
 const errorMessage = ref('');
+const settingsBusy = ref(false);
+const externalBusy = ref(false);
 const section = computed(() => String(route.params.section || 'general'));
 const settings = computed(() => wallStore.snapshot.settings);
 const tabs = [
@@ -24,21 +26,43 @@ const scaleModes = [
 ] as const;
 
 async function change<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
+    if (settingsBusy.value) return;
     errorMessage.value = '';
+    settingsBusy.value = true;
     try {
         await updateSettings({ ...settings.value, [key]: value });
     } catch (error) {
         errorMessage.value = readError(error);
+    } finally {
+        settingsBusy.value = false;
     }
 }
 
 async function run(action: () => Promise<unknown>) {
+    if (externalBusy.value) return;
     errorMessage.value = '';
+    externalBusy.value = true;
     try {
         await action();
     } catch (error) {
         errorMessage.value = readError(error);
+    } finally {
+        externalBusy.value = false;
     }
+}
+
+function moveScaleMode(event: KeyboardEvent, direction: -1 | 1) {
+    if (settingsBusy.value) return;
+    const current = event.currentTarget;
+    if (!(current instanceof HTMLButtonElement) || !current.parentElement) return;
+    const buttons = Array.from(current.parentElement.querySelectorAll<HTMLButtonElement>('button'));
+    const currentIndex = buttons.indexOf(current);
+    if (currentIndex < 0) return;
+    const next = buttons[(currentIndex + direction + buttons.length) % buttons.length];
+    const mode = next.dataset.scaleMode as AppSettings['scaleMode'] | undefined;
+    if (!mode) return;
+    void change('scaleMode', mode);
+    next.focus();
 }
 
 function readError(error: unknown): string {
@@ -48,7 +72,7 @@ function readError(error: unknown): string {
 </script>
 
 <template>
-    <section class="page settings-page">
+    <section class="page settings-page" :aria-busy="settingsBusy || externalBusy">
         <h1>设置</h1>
         <nav class="tabs settings-tabs" aria-label="设置分类">
             <RouterLink
@@ -68,6 +92,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.autoStart"
                     :class="{ on: settings.autoStart }"
                     @click="change('autoStart', !settings.autoStart)"
@@ -80,6 +105,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.closeToTray"
                     :class="{ on: settings.closeToTray }"
                     @click="change('closeToTray', !settings.closeToTray)"
@@ -92,6 +118,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.restoreLastWallpaper"
                     :class="{ on: settings.restoreLastWallpaper }"
                     @click="change('restoreLastWallpaper', !settings.restoreLastWallpaper)"
@@ -115,8 +142,13 @@ function readError(error: unknown): string {
                     <button
                         v-for="mode in scaleModes"
                         :key="mode.value"
+                        :data-scale-mode="mode.value"
+                        :disabled="settingsBusy"
                         :class="{ active: settings.scaleMode === mode.value }"
+                        :aria-pressed="settings.scaleMode === mode.value"
                         @click="change('scaleMode', mode.value)"
+                        @keydown.left.prevent="moveScaleMode($event, -1)"
+                        @keydown.right.prevent="moveScaleMode($event, 1)"
                     >
                         {{ mode.label }}
                     </button>
@@ -126,6 +158,7 @@ function readError(error: unknown): string {
                 <div><strong>画幅</strong><small>覆盖视频的逻辑宽高比</small></div>
                 <select
                     data-setting="aspect-ratio"
+                    :disabled="settingsBusy"
                     :value="settings.aspectRatio"
                     @change="
                         change('aspectRatio', ($event.target as HTMLSelectElement).value as AppSettings['aspectRatio'])
@@ -146,6 +179,7 @@ function readError(error: unknown): string {
                 <div><strong>抗锯齿</strong><small>更高质量会增加 GPU 占用</small></div>
                 <select
                     data-setting="anti-aliasing"
+                    :disabled="settingsBusy"
                     :value="settings.antiAliasing"
                     @change="
                         change(
@@ -163,6 +197,7 @@ function readError(error: unknown): string {
                 <div><strong>帧率上限</strong><small>降低数值可以减少 GPU 占用</small></div>
                 <select
                     data-setting="frame-rate"
+                    :disabled="settingsBusy"
                     :value="settings.frameRate"
                     @change="
                         change(
@@ -182,6 +217,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.hardwareDecoding"
                     :class="{ on: settings.hardwareDecoding }"
                     @click="change('hardwareDecoding', !settings.hardwareDecoding)"
@@ -195,6 +231,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.defaultMuted"
                     :class="{ on: settings.defaultMuted }"
                     @click="change('defaultMuted', !settings.defaultMuted)"
@@ -210,6 +247,7 @@ function readError(error: unknown): string {
                     type="range"
                     min="0"
                     max="100"
+                    :disabled="settingsBusy"
                     :value="settings.volume"
                     :style="{ '--range-progress': `${settings.volume}%` }"
                     @change="change('volume', Number(($event.target as HTMLInputElement).value))"
@@ -225,6 +263,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.pauseOnMaximized"
                     :class="{ on: settings.pauseOnMaximized }"
                     @click="change('pauseOnMaximized', !settings.pauseOnMaximized)"
@@ -237,6 +276,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.pauseOnFullscreen"
                     :class="{ on: settings.pauseOnFullscreen }"
                     @click="change('pauseOnFullscreen', !settings.pauseOnFullscreen)"
@@ -249,6 +289,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.pauseOnBattery"
                     :class="{ on: settings.pauseOnBattery }"
                     @click="change('pauseOnBattery', !settings.pauseOnBattery)"
@@ -261,6 +302,7 @@ function readError(error: unknown): string {
                 <button
                     class="toggle"
                     role="switch"
+                    :disabled="settingsBusy"
                     :aria-checked="settings.pauseOnDisplaySleep"
                     :class="{ on: settings.pauseOnDisplaySleep }"
                     @click="change('pauseOnDisplaySleep', !settings.pauseOnDisplaySleep)"
@@ -287,11 +329,14 @@ function readError(error: unknown): string {
                 <dd>bluechai@qq.com</dd>
             </dl>
             <div class="button-row">
-                <button class="secondary button-medium" @click="run(openLicense)">查看开源许可证</button
-                ><button class="secondary button-medium" @click="run(openProjectHomepage)">打开项目主页</button>
+                <button class="secondary button-medium" :disabled="externalBusy" @click="run(openLicense)">
+                    查看开源许可证</button
+                ><button class="secondary button-medium" :disabled="externalBusy" @click="run(openProjectHomepage)">
+                    打开项目主页
+                </button>
             </div>
             <small class="offline-notice">点击后使用系统默认浏览器打开；Wall 自身不请求网络。</small>
         </div>
-        <p v-if="errorMessage" class="inline-error">{{ errorMessage }}</p>
+        <p v-if="errorMessage" class="inline-error" role="alert">{{ errorMessage }}</p>
     </section>
 </template>

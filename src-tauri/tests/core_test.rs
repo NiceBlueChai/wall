@@ -121,6 +121,22 @@ fn category_lifecycle_preserves_media_and_updates_assignments() {
 }
 
 #[test]
+fn category_name_accepts_40_characters_and_rejects_41_characters() {
+    let mut core = WallCore::new(AppSnapshot::default());
+    let valid_name = "😀".repeat(40);
+    let category = core
+        .create_category(&valid_name)
+        .expect("accept 40-character category name");
+    assert_eq!(category.name.chars().count(), 40);
+
+    let error = core
+        .create_category(&"😀".repeat(41))
+        .expect_err("reject 41-character category name");
+    assert_eq!(error.code, "invalid_category_name");
+    assert_eq!(error.message, "分类名称最多 40 个字符");
+}
+
+#[test]
 fn category_membership_rejects_unknown_ids_without_partial_updates() {
     let root = test_root("category-atomic");
     let video = root.join("ocean.mp4");
@@ -315,6 +331,139 @@ fn removing_one_running_wallpaper_preserves_other_display_targets() {
         Some(first_id.as_str())
     );
     assert_eq!(core.snapshot().playback.status, PlaybackStatus::Playing);
+    fs::remove_dir_all(root).expect("clean test directory");
+}
+
+#[test]
+fn media_scoped_pause_and_stop_update_all_matching_targets_together() {
+    let root = test_root("media-scoped-playback");
+    let first_video = root.join("first.mp4");
+    let second_video = root.join("second.mp4");
+    fs::write(&first_video, b"first").expect("create first video");
+    fs::write(&second_video, b"second").expect("create second video");
+    let mut snapshot = AppSnapshot {
+        displays: vec![
+            display("left", -1920, true),
+            display("center", 0, false),
+            display("right", 1920, false),
+        ],
+        ..Default::default()
+    };
+    let imported =
+        import_media(&mut snapshot, &[first_video, second_video]).expect("import videos");
+    let first_id = imported[0].id.clone();
+    let second_id = imported[1].id.clone();
+    let mut core = WallCore::new(snapshot);
+    for display_id in ["left", "center"] {
+        core.set_display_layout(DisplayMode::Independent, vec![display_id.to_owned()])
+            .expect("select display");
+        core.play(&first_id).expect("play first wallpaper");
+    }
+    core.set_display_layout(DisplayMode::Independent, vec!["right".to_owned()])
+        .expect("select right display");
+    core.play(&second_id).expect("play second wallpaper");
+
+    assert!(
+        core.toggle_media_pause(&first_id)
+            .expect("pause first wallpaper")
+    );
+    assert!(
+        core.snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .filter(|assignment| assignment.wallpaper_id == first_id)
+            .all(|assignment| assignment.pause_reasons.contains(&PauseReason::Manual))
+    );
+    assert_eq!(
+        core.snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .find(|assignment| assignment.wallpaper_id == second_id)
+            .expect("second assignment")
+            .status,
+        PlaybackStatus::Playing
+    );
+
+    assert!(
+        !core
+            .toggle_media_pause(&first_id)
+            .expect("resume first wallpaper")
+    );
+    core.stop_media_playback(&first_id)
+        .expect("stop first wallpaper targets");
+    assert_eq!(core.snapshot().playback.display_assignments.len(), 1);
+    assert_eq!(
+        core.snapshot().playback.display_assignments[0].wallpaper_id,
+        second_id
+    );
+    fs::remove_dir_all(root).expect("clean test directory");
+}
+
+#[test]
+fn refresh_missing_rechecks_every_library_path() {
+    let root = test_root("refresh-missing");
+    let first_video = root.join("first.mp4");
+    let second_video = root.join("second.mp4");
+    fs::write(&first_video, b"first").expect("create first video");
+    fs::write(&second_video, b"second").expect("create second video");
+    let mut snapshot = AppSnapshot::default();
+    let imported =
+        import_media(&mut snapshot, &[first_video, second_video.clone()]).expect("import videos");
+    let second_id = imported[1].id.clone();
+    fs::remove_file(&second_video).expect("remove second video");
+    let mut core = WallCore::new(snapshot);
+
+    assert_eq!(core.refresh_missing(), vec![second_id]);
+    assert!(!core.snapshot().library[0].missing);
+    assert!(core.snapshot().library[1].missing);
+
+    fs::write(&second_video, b"restored").expect("restore second video");
+    assert!(core.refresh_missing().is_empty());
+    assert!(core.snapshot().library.iter().all(|item| !item.missing));
+    fs::remove_dir_all(root).expect("clean test directory");
+}
+
+#[test]
+fn batch_remove_is_atomic_and_preserves_source_files() {
+    let root = test_root("batch-remove");
+    let first_video = root.join("first.mp4");
+    let second_video = root.join("second.mp4");
+    fs::write(&first_video, b"first").expect("create first video");
+    fs::write(&second_video, b"second").expect("create second video");
+    let mut snapshot = AppSnapshot {
+        displays: vec![display("left", -1920, true), display("right", 0, false)],
+        ..Default::default()
+    };
+    let imported = import_media(&mut snapshot, &[first_video.clone(), second_video.clone()])
+        .expect("import videos");
+    let first_id = imported[0].id.clone();
+    let second_id = imported[1].id.clone();
+    let mut core = WallCore::new(snapshot);
+    core.set_display_layout(DisplayMode::Independent, vec!["left".to_owned()])
+        .expect("select left");
+    core.play(&first_id).expect("play left");
+    core.set_display_layout(DisplayMode::Independent, vec!["right".to_owned()])
+        .expect("select right");
+    core.play(&second_id).expect("play right");
+
+    let error = core
+        .remove_many(&[first_id.clone(), "unknown".to_owned()])
+        .expect_err("reject unknown wallpaper");
+
+    assert_eq!(error.code, "wallpaper_not_found");
+    assert_eq!(core.snapshot().library.len(), 2);
+    assert_eq!(core.snapshot().playback.display_assignments.len(), 2);
+
+    core.remove_many(&[first_id, second_id])
+        .expect("remove wallpapers");
+
+    assert!(core.snapshot().library.is_empty());
+    assert!(core.snapshot().playback.display_assignments.is_empty());
+    assert_eq!(core.snapshot().playback.status, PlaybackStatus::Idle);
+    assert!(first_video.is_file());
+    assert!(second_video.is_file());
     fs::remove_dir_all(root).expect("clean test directory");
 }
 

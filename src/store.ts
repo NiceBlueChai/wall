@@ -36,7 +36,9 @@ export function createWallStore() {
         activeCategoryId: null as string | null,
         batchMode: false,
         selectedMediaIds: [] as string[],
+        notice: '',
     });
+    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
     return {
         get snapshot() {
@@ -65,6 +67,9 @@ export function createWallStore() {
         },
         get selectedMediaIds() {
             return state.selectedMediaIds;
+        },
+        get notice() {
+            return state.notice;
         },
         get filteredLibrary(): WallpaperItem[] {
             const query = state.search.trim().toLocaleLowerCase();
@@ -96,6 +101,25 @@ export function createWallStore() {
             state.selectedMediaIds = state.selectedMediaIds.includes(mediaId)
                 ? state.selectedMediaIds.filter((id) => id !== mediaId)
                 : [...state.selectedMediaIds, mediaId];
+        },
+        isMediaActive(mediaId: string) {
+            const assignments = state.snapshot.playback.displayAssignments ?? [];
+            return assignments.length
+                ? assignments.some((assignment) => assignment.wallpaperId === mediaId)
+                : state.snapshot.playback.activeId === mediaId;
+        },
+        showNotice(message: string) {
+            if (noticeTimer) clearTimeout(noticeTimer);
+            state.notice = message;
+            noticeTimer = setTimeout(() => {
+                state.notice = '';
+                noticeTimer = undefined;
+            }, 3000);
+        },
+        clearNotice() {
+            if (noticeTimer) clearTimeout(noticeTimer);
+            noticeTimer = undefined;
+            state.notice = '';
         },
     };
 }

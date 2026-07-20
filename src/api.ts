@@ -30,12 +30,22 @@ export async function importMedia(paths: string[]) {
 export const play = (mediaId: string) => snapshotCommand('play', { mediaId });
 export const togglePause = () => snapshotCommand('toggle_pause');
 export const toggleTargetPause = (targetId: string) => snapshotCommand('toggle_target_pause', { targetId });
+/** 原子地切换使用指定壁纸的全部目标的手动暂停状态。 */
+export const toggleMediaPause = (mediaId: string) => snapshotCommand('toggle_media_pause', { mediaId });
 export const stop = () => snapshotCommand('stop');
 export const stopTarget = (targetId: string) => snapshotCommand('stop_target', { targetId });
+/** 原子地停止使用指定壁纸的全部显示目标。 */
+export const stopMedia = (mediaId: string) => snapshotCommand('stop_media', { mediaId });
 export const setMuted = (muted: boolean) => snapshotCommand('set_muted', { muted });
 export const setVolume = (volume: number) => snapshotCommand('set_volume', { volume });
 export const setScaleMode = (mode: ScaleMode) => snapshotCommand('set_scale_mode', { mode });
 export const removeMedia = (mediaId: string) => snapshotCommand('remove_media', { mediaId });
+/** 原子地移除多条壁纸库记录，不修改源文件。 */
+export const removeMediaBatch = (mediaIds: string[]) => snapshotCommand('remove_media_batch', { mediaIds });
+/** 重新扫描整个壁纸库并刷新文件失效状态。 */
+export const scanLibrary = () => snapshotCommand('scan_library');
+/** 重新扫描后移除全部失效记录，不修改源文件。 */
+export const removeMissingMedia = () => snapshotCommand('remove_missing_media');
 export const relocateMedia = (mediaId: string, path: string) => snapshotCommand('relocate_media', { mediaId, path });
 export const createCategory = (name: string) => snapshotCommand('create_category', { name });
 export const renameCategory = (categoryId: string, name: string) =>

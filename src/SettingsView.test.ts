@@ -1,9 +1,9 @@
 /** 验证四个设置页的职责分离，防止版本信息重新泄漏到常规页。 */
 // @vitest-environment jsdom
 
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { wallStore, defaultSettings } from './store';
 import SettingsView from './views/SettingsView.vue';
 
@@ -18,9 +18,11 @@ vi.mock('./api', () => ({
     openLicense: mocks.openLicense,
     openProjectHomepage: mocks.openProjectHomepage,
 }));
+enableAutoUnmount(afterEach);
 
 describe('SettingsView', () => {
     beforeEach(() => {
+        Object.values(mocks).forEach((mock) => mock.mockReset());
         wallStore.applySnapshot({
             library: [],
             categories: [],
@@ -82,14 +84,17 @@ describe('SettingsView', () => {
         });
         await router.push('/settings/playback');
         await router.isReady();
-        const wrapper = mount(SettingsView, { global: { plugins: [router] } });
+        const wrapper = mount(SettingsView, { attachTo: document.body, global: { plugins: [router] } });
 
         expect(wrapper.text()).toContain('画面');
         expect(wrapper.text()).toContain('声音');
         const scaleModeButtons = wrapper.findAll('.segmented.compact button');
         expect(scaleModeButtons.map((button) => button.text())).toEqual(['填充', '适应', '拉伸']);
-        await scaleModeButtons[1].trigger('click');
+        expect(scaleModeButtons[0].attributes('aria-pressed')).toBe('true');
+        (scaleModeButtons[0].element as HTMLElement).focus();
+        await scaleModeButtons[0].trigger('keydown', { key: 'ArrowRight' });
         await flushPromises();
+        expect(document.activeElement).toBe(scaleModeButtons[1].element);
         expect(mocks.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ scaleMode: 'contain' }));
         expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('21:9');
         expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('高质量');
@@ -103,5 +108,40 @@ describe('SettingsView', () => {
         await flushPromises();
         expect(wrapper.text()).toContain('最大化应用时');
         expect(wrapper.findAll('[role="switch"]')).toHaveLength(4);
+    });
+
+    it('disables settings while saving and keeps the server snapshot after a recoverable error', async () => {
+        let resolveSave!: () => void;
+        const pending = new Promise<void>((resolve) => {
+            resolveSave = resolve;
+        });
+        mocks.updateSettings.mockReturnValue(pending);
+        const router = createRouter({
+            history: createMemoryHistory(),
+            routes: [{ path: '/settings/:section', component: SettingsView }],
+        });
+        await router.push('/settings/general');
+        await router.isReady();
+        const wrapper = mount(SettingsView, { global: { plugins: [router] } });
+        const autoStart = wrapper.findAll('[role="switch"]')[0];
+
+        await autoStart.trigger('click');
+        await autoStart.trigger('click');
+        await wrapper.vm.$nextTick();
+
+        expect(mocks.updateSettings).toHaveBeenCalledOnce();
+        expect(wrapper.findAll('[role="switch"]').every((button) => 'disabled' in button.attributes())).toBe(true);
+
+        resolveSave();
+        await flushPromises();
+        expect(autoStart.attributes('disabled')).toBeUndefined();
+
+        mocks.updateSettings.mockRejectedValueOnce(new Error('设置保存失败'));
+        await autoStart.trigger('click');
+        await flushPromises();
+
+        expect(wrapper.get('.inline-error').text()).toBe('设置保存失败');
+        expect(autoStart.attributes('aria-checked')).toBe('false');
+        expect(autoStart.attributes('disabled')).toBeUndefined();
     });
 });

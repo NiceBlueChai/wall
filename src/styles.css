@@ -6,7 +6,7 @@
     font-synthesis: none;
     --text-primary: #f4f6ff;
     --text-secondary: #a6acc7;
-    --text-muted: #72799a;
+    --text-muted: #7d85a3;
     --surface-canvas: #080a12;
     --surface-sidebar: #0d1020;
     --surface-panel: #111529;
@@ -260,11 +260,20 @@ select:focus-visible,
 .sidebar-status i.inactive {
     background: var(--text-muted);
 }
+.sidebar-status i.error {
+    background: var(--danger);
+}
 .main-content {
     min-width: 0;
     min-height: 0;
     overflow: auto;
     background: var(--surface-canvas);
+}
+html:has(.modal-scrim) .main-content {
+    overflow: hidden;
+}
+.page-modal-background {
+    display: contents;
 }
 .page {
     width: 100%;
@@ -296,6 +305,25 @@ select:focus-visible,
 .batch-actions > span {
     color: var(--text-secondary);
     font-size: 12px;
+}
+.batch-remove-action {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 7px;
+    color: var(--danger);
+    background: transparent;
+    font-size: 13px;
+    font-weight: 500;
+}
+.batch-remove-action:hover:not(:disabled) {
+    background: var(--surface-hover);
+}
+.batch-remove-action:disabled {
+    opacity: 0.45;
 }
 .batch-action-wrap {
     position: relative;
@@ -335,6 +363,45 @@ select:focus-visible,
 .batch-category-menu small {
     font-size: 11px;
 }
+.library-management-wrap {
+    position: relative;
+}
+.library-management-button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.library-management-menu {
+    position: absolute;
+    top: 48px;
+    right: 0;
+    width: 208px;
+    padding: 8px;
+    z-index: 20;
+    border: 1px solid var(--border-default);
+    border-radius: 10px;
+    background: var(--surface-panel);
+}
+.library-management-menu button {
+    width: 100%;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    color: var(--text-secondary);
+    background: transparent;
+    font-size: 13px;
+}
+.library-management-menu button:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+}
+.library-management-menu button.danger-action {
+    color: var(--danger);
+}
 .display-target-wrap {
     position: relative;
 }
@@ -364,6 +431,20 @@ select:focus-visible,
     border: 1px solid var(--border-default);
     border-radius: 12px;
     background: var(--surface-panel);
+}
+.display-panel-heading {
+    min-height: 28px;
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+}
+.display-panel-heading h2 {
+    margin: 0;
+    font-size: 15px;
+}
+.display-panel-heading .dialog-close {
+    top: 10px;
+    right: 10px;
 }
 .display-mode-selector {
     display: grid;
@@ -509,6 +590,12 @@ button:disabled {
     border-color: var(--border-strong);
     background: var(--surface-elevated);
 }
+.danger:hover:not(:disabled) {
+    filter: brightness(1.08);
+}
+.danger-quiet:hover:not(:disabled) {
+    background: var(--surface-hover);
+}
 .search-field {
     width: 300px;
     height: 36px;
@@ -608,6 +695,34 @@ button:disabled {
     width: 100%;
     height: 100%;
     object-fit: cover;
+}
+.card-quick-play {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    opacity: 0;
+    pointer-events: none;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: var(--surface-elevated);
+    transition:
+        opacity 0.15s,
+        background 0.15s;
+}
+.wallpaper-card:hover .card-quick-play,
+.wallpaper-card:focus-within .card-quick-play {
+    opacity: 1;
+    pointer-events: auto;
+}
+.card-quick-play:hover,
+.card-quick-play:focus-visible {
+    background: var(--surface-hover);
 }
 .card-checkbox {
     position: absolute;
@@ -733,6 +848,49 @@ button:disabled {
     justify-content: flex-end;
     gap: 10px;
 }
+.removal-dialog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+.removal-dialog h2,
+.removal-dialog p {
+    margin: 0;
+}
+.dialog-close {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    color: var(--text-secondary);
+    background: transparent;
+}
+.dialog-close:hover:not(:disabled) {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+}
+.removal-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--danger);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: var(--surface-elevated);
+    font-size: 12px;
+    line-height: 18px;
+}
+.removal-warning .wall-icon {
+    flex: none;
+}
 .progress {
     height: 4px;
     overflow: hidden;
@@ -755,6 +913,16 @@ button:disabled {
 .detail-page .page-heading {
     margin-bottom: 18px;
 }
+.detail-heading-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.detail-heading-actions button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
 .back-button {
     width: 32px;
     height: 32px;
@@ -770,11 +938,12 @@ button:disabled {
 }
 .detail-grid {
     display: grid;
-    grid-template-columns: minmax(440px, 674px) minmax(280px, 330px);
+    grid-template-columns: 620px 384px;
     gap: 20px;
 }
 .media-preview {
-    height: 420px;
+    position: relative;
+    height: 324px;
     overflow: hidden;
     display: grid;
     place-items: center;
@@ -788,14 +957,33 @@ button:disabled {
     height: 100%;
     object-fit: contain;
 }
+.preview-play-button {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 1;
+    width: 60px;
+    height: 60px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgb(255 255 255 / 22%);
+    border-radius: 50%;
+    background: rgb(8 10 18 / 78%);
+}
+.preview-play-button:hover {
+    background: rgb(17 21 41 / 90%);
+}
 .preview-fallback {
     color: var(--text-muted);
     letter-spacing: 0.15em;
 }
 .detail-card {
-    min-height: 420px;
+    height: 324px;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
     padding: 22px;
     border-radius: 14px;
     background: var(--surface-panel);
@@ -809,6 +997,8 @@ button:disabled {
     font-size: 11px;
 }
 .detail-card p {
+    max-height: 64px;
+    overflow: auto;
     color: var(--text-secondary);
     font-size: 12px;
     line-height: 1.7;
@@ -828,6 +1018,8 @@ button:disabled {
 .detail-targets {
     display: grid;
     gap: 4px;
+    max-height: 72px;
+    overflow: auto;
     padding: 12px 0;
     color: var(--text-secondary);
     font-size: 12px;
@@ -854,11 +1046,11 @@ button:disabled {
     margin-top: auto;
 }
 .detail-settings {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(220px, 1fr));
-    gap: 18px;
+    height: 280px;
+    display: flex;
+    flex-direction: column;
     margin-top: 18px;
-    padding: 20px 22px;
+    padding: 9px 20px;
     border-radius: 14px;
     background: var(--surface-panel);
 }
@@ -868,6 +1060,8 @@ button:disabled {
     flex-wrap: wrap;
     align-items: center;
     gap: 6px;
+    max-height: 58px;
+    overflow: auto;
     margin-top: 10px;
 }
 .category-tag {
@@ -923,16 +1117,22 @@ button:disabled {
     background: var(--surface-hover);
 }
 .detail-settings-header {
-    grid-column: 1 / -1;
+    height: 32px;
+    flex: none;
     display: flex;
     align-items: center;
     gap: 10px;
 }
 .detail-settings-header > button {
+    height: 32px;
+    min-height: 32px;
     margin-left: auto;
 }
 .inheritance-pill {
-    padding: 4px 8px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 12px;
     border: 1px solid var(--border-default);
     border-radius: 999px;
     color: var(--text-secondary);
@@ -943,6 +1143,24 @@ button:disabled {
     color: var(--accent-hover);
     background: var(--surface-selected);
 }
+.detail-settings-primary {
+    display: grid;
+    grid-template-columns: 360px 190px 190px 184px;
+    gap: 20px;
+    height: 68px;
+    margin-top: 16px;
+}
+.detail-settings-video {
+    display: grid;
+    grid-template-columns: 180px 180px 584px;
+    gap: 20px;
+    height: 68px;
+    margin-top: 24px;
+}
+.detail-setting-field {
+    min-width: 0;
+    height: 68px;
+}
 .detail-setting-field label {
     display: block;
     margin-bottom: 8px;
@@ -951,7 +1169,7 @@ button:disabled {
 }
 .detail-setting-field select {
     width: 100%;
-    height: 40px;
+    height: 36px;
     padding: 0 36px 0 12px;
     appearance: none;
     border: 1px solid var(--border-default);
@@ -964,16 +1182,28 @@ button:disabled {
     background: var(--surface-elevated);
 }
 .detail-setting-field.inline-field {
-    min-height: 64px;
+    min-height: 68px;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    padding: 0 14px;
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+    background: var(--surface-elevated);
 }
 .detail-setting-field.inline-field label {
     margin: 0;
 }
 .volume-field {
-    grid-column: span 2;
+    width: 100%;
+}
+.volume-field input {
+    width: 100%;
+}
+.image-settings-note {
+    margin: 30px 0 0;
+    color: var(--text-muted);
+    font-size: 12px;
 }
 .segmented {
     width: 360px;
@@ -1238,6 +1468,11 @@ input[type='range']:hover::-webkit-slider-thumb {
     color: #ffb5bf;
     background: #2b1620;
 }
+.success-toast {
+    border: 1px solid var(--success);
+    color: var(--text-primary);
+    background: var(--surface-panel);
+}
 @media (max-width: 1050px) {
     .search-field {
         width: 220px;
@@ -1249,9 +1484,19 @@ input[type='range']:hover::-webkit-slider-thumb {
         grid-template-columns: 1fr;
     }
     .detail-card {
+        height: auto;
         min-height: 300px;
     }
     .detail-settings {
-        flex-wrap: wrap;
+        height: auto;
+        padding-bottom: 20px;
+    }
+    .detail-settings-primary,
+    .detail-settings-video {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        height: auto;
+    }
+    .detail-settings-video .volume-field {
+        grid-column: 1 / -1;
     }
 }

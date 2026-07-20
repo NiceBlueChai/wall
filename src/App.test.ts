@@ -1,9 +1,9 @@
 /** 验证自定义标题栏按钮调用原生窗口 API，并拥有对应 Tauri 权限。 */
 // @vitest-environment jsdom
 
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import capability from '../src-tauri/capabilities/default.json';
 import App from './App.vue';
 import { defaultSettings, wallStore } from './store';
@@ -29,6 +29,7 @@ vi.mock('./api', () => ({
     listenToSnapshots: vi.fn(async () => () => undefined),
     renameCategory: vi.fn(),
 }));
+enableAutoUnmount(afterEach);
 
 describe('App window controls', () => {
     beforeEach(() => {
@@ -38,6 +39,7 @@ describe('App window controls', () => {
         minimizeMock.mockReset();
         wallStore.exitBatchMode();
         wallStore.activeCategoryId = null;
+        wallStore.clearNotice();
         wallStore.applySnapshot({
             library: [],
             categories: [],
@@ -78,7 +80,7 @@ describe('App window controls', () => {
         expect(closeMock).toHaveBeenCalledOnce();
     });
 
-    it('uses the confirmed category sidebar and enters batch management', async () => {
+    it('keeps category management focused on category actions', async () => {
         wallStore.applySnapshot({
             library: [media('ocean', ['nature']), media('city', ['city'])],
             categories: [
@@ -109,9 +111,181 @@ describe('App window controls', () => {
         expect(createCategoryMock).toHaveBeenCalledWith(' 动漫收藏 ');
 
         await wrapper.get('[aria-label="管理分类"]').trigger('click');
-        await wrapper.get('[data-category-action="batch"]').trigger('click');
         expect(wallStore.activeCategoryId).toBe('nature');
-        expect(wallStore.batchMode).toBe(true);
+        expect(wrapper.find('[data-category-action="batch"]').exists()).toBe(false);
+        expect(wrapper.find('[data-category-action="rename"]').exists()).toBe(true);
+        expect(wrapper.find('[data-category-action="delete"]').exists()).toBe(true);
+    });
+
+    it('supports keyboard navigation and dismissal for the category menu', async () => {
+        wallStore.applySnapshot({
+            library: [media('ocean', ['nature'])],
+            categories: [{ id: 'nature', name: '自然风景' }],
+            settings: defaultSettings(),
+            playback: idlePlayback(),
+        });
+        wallStore.activeCategoryId = 'nature';
+        const wrapper = await mountApp();
+        const trigger = wrapper.get('[aria-label="管理分类"]');
+
+        await trigger.trigger('keydown', { key: 'ArrowDown' });
+        await wrapper.vm.$nextTick();
+        const items = wrapper.findAll('.category-action-menu [role="menuitem"]');
+        expect(items).toHaveLength(3);
+        expect(document.activeElement).toBe(items[0].element);
+
+        await items[0].trigger('keydown', { key: 'End' });
+        expect(document.activeElement).toBe(items[2].element);
+        await items[2].trigger('keydown', { key: 'ArrowDown' });
+        expect(document.activeElement).toBe(items[0].element);
+
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await wrapper.vm.$nextTick();
+        expect(wrapper.find('.category-action-menu').exists()).toBe(false);
+        expect(document.activeElement).toBe(trigger.element);
+
+        await trigger.trigger('click');
+        const outside = wrapper.get('[aria-label="添加分类"]');
+        (outside.element as HTMLElement).focus();
+        outside.element.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+        await wrapper.vm.$nextTick();
+        expect(wrapper.find('.category-action-menu').exists()).toBe(false);
+        expect(document.activeElement).toBe(trigger.element);
+    });
+
+    it('locks category submission, traps focus and restores the dialog trigger', async () => {
+        let resolveCreate!: () => void;
+        const pending = new Promise<void>((resolve) => {
+            resolveCreate = resolve;
+        });
+        createCategoryMock.mockReturnValue(pending);
+        const wrapper = await mountApp();
+        const trigger = wrapper.get('[aria-label="添加分类"]');
+
+        await trigger.trigger('click');
+        await wrapper.vm.$nextTick();
+        const dialog = wrapper.get('.category-dialog');
+        const input = dialog.get('input');
+        expect(dialog.attributes('role')).toBe('dialog');
+        expect(dialog.attributes('aria-modal')).toBe('true');
+        expect(dialog.attributes('tabindex')).toBe('-1');
+        expect(wrapper.get('.titlebar').attributes()).toHaveProperty('inert');
+        expect(wrapper.get('.body-shell').attributes()).toHaveProperty('inert');
+        expect(document.activeElement).toBe(input.element);
+
+        const submit = dialog.get('button[type="submit"]');
+        (submit.element as HTMLElement).focus();
+        await submit.trigger('keydown', { key: 'Tab' });
+        expect(document.activeElement).toBe(input.element);
+        await input.trigger('keydown', { key: 'Tab', shiftKey: true });
+        expect(document.activeElement).toBe(submit.element);
+
+        await input.setValue('动漫收藏');
+        await dialog.get('form').trigger('submit');
+        await dialog.get('form').trigger('submit');
+        await wrapper.vm.$nextTick();
+        expect(createCategoryMock).toHaveBeenCalledOnce();
+        expect(dialog.get('[data-category-cancel]').attributes()).toHaveProperty('disabled');
+        expect(input.attributes()).toHaveProperty('disabled');
+        expect(document.activeElement).toBe(dialog.element);
+        await dialog.trigger('keydown', { key: 'Tab' });
+        expect(document.activeElement).toBe(dialog.element);
+
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await wrapper.vm.$nextTick();
+        expect(wrapper.find('.category-dialog').exists()).toBe(true);
+
+        resolveCreate();
+        await flushPromises();
+        expect(wrapper.find('.category-dialog').exists()).toBe(false);
+        expect(wrapper.get('.titlebar').attributes('inert')).toBeUndefined();
+        expect(wrapper.get('.body-shell').attributes('inert')).toBeUndefined();
+        expect(document.activeElement).toBe(trigger.element);
+    });
+
+    it('counts non-BMP category names by Unicode code point at the 40-character boundary', async () => {
+        const wrapper = await mountApp();
+
+        await wrapper.get('[aria-label="添加分类"]').trigger('click');
+        const input = wrapper.get('.category-dialog input');
+        expect(input.attributes('maxlength')).toBeUndefined();
+        await input.setValue('😀'.repeat(40));
+        await wrapper.get('.category-dialog form').trigger('submit');
+        await flushPromises();
+
+        expect(createCategoryMock).toHaveBeenCalledWith('😀'.repeat(40));
+
+        await wrapper.get('[aria-label="添加分类"]').trigger('click');
+        await wrapper.get('.category-dialog input').setValue('😀'.repeat(41));
+        await wrapper.get('.category-dialog form').trigger('submit');
+        await flushPromises();
+
+        expect(createCategoryMock).toHaveBeenCalledOnce();
+        expect(wrapper.get('.category-dialog .inline-error').text()).toBe('分类名称最多 40 个字符');
+    });
+
+    it('renders shared success notices through the existing toast surface', async () => {
+        const router = createRouter({
+            history: createMemoryHistory(),
+            routes: [
+                { path: '/', name: 'library', component: { template: '<div />' } },
+                { path: '/settings/:section', name: 'settings', component: { template: '<div />' } },
+            ],
+        });
+        await router.push('/');
+        await router.isReady();
+        const wrapper = mount(App, { global: { plugins: [router] } });
+
+        wallStore.showNotice('已从壁纸库移除');
+        await wrapper.vm.$nextTick();
+
+        const notice = wrapper.get('.success-toast');
+        expect(notice.text()).toBe('已从壁纸库移除');
+        expect(notice.attributes('role')).toBe('status');
+        expect(notice.attributes('aria-live')).toBe('polite');
+        wrapper.unmount();
+        wallStore.clearNotice();
+    });
+
+    it('summarizes multiple display targets across running, paused and error states', async () => {
+        const router = createRouter({
+            history: createMemoryHistory(),
+            routes: [{ path: '/', name: 'library', component: { template: '<div />' } }],
+        });
+        await router.push('/');
+        await router.isReady();
+        wallStore.applySnapshot({
+            library: [media('ocean', []), media('city', [])],
+            categories: [],
+            settings: defaultSettings(),
+            playback: playbackWithStatuses('playing', 'playing'),
+            displays: [display('left', true), display('right', false)],
+        });
+        const wrapper = mount(App, { global: { plugins: [router] } });
+
+        expect(wrapper.get('.sidebar-status').text()).toBe('2 个显示目标 · 运行中');
+
+        wallStore.applySnapshot({
+            ...wallStore.snapshot,
+            playback: playbackWithStatuses('playing', 'paused'),
+        });
+        await wrapper.vm.$nextTick();
+        expect(wrapper.get('.sidebar-status').text()).toBe('2 个显示目标 · 部分暂停');
+
+        wallStore.applySnapshot({
+            ...wallStore.snapshot,
+            playback: playbackWithStatuses('paused', 'paused'),
+        });
+        await wrapper.vm.$nextTick();
+        expect(wrapper.get('.sidebar-status').text()).toBe('2 个显示目标 · 全部暂停');
+
+        wallStore.applySnapshot({
+            ...wallStore.snapshot,
+            playback: playbackWithStatuses('playing', 'error'),
+        });
+        await wrapper.vm.$nextTick();
+        expect(wrapper.get('.sidebar-status').text()).toBe('2 个显示目标 · 错误');
+        expect(wrapper.get('.sidebar-status i').classes()).toContain('error');
     });
 
     it('suppresses the browser context menu outside editable controls', async () => {
@@ -161,5 +335,61 @@ function idlePlayback() {
         volume: 0,
         pauseReasons: [],
         lastError: null,
+    };
+}
+
+async function mountApp() {
+    const router = createRouter({
+        history: createMemoryHistory(),
+        routes: [
+            { path: '/', name: 'library', component: { template: '<div />' } },
+            { path: '/settings/:section', name: 'settings', component: { template: '<div />' } },
+        ],
+    });
+    await router.push('/');
+    await router.isReady();
+    return mount(App, { attachTo: document.body, global: { plugins: [router] } });
+}
+
+function playbackWithStatuses(first: 'playing' | 'paused' | 'error', second: 'playing' | 'paused' | 'error') {
+    return {
+        ...idlePlayback(),
+        activeId: 'ocean',
+        status: first,
+        displayAssignments: [
+            displayAssignment('display:left', 'left', 'ocean', first),
+            displayAssignment('display:right', 'right', 'city', second),
+        ],
+    };
+}
+
+function displayAssignment(
+    targetId: string,
+    displayId: string,
+    wallpaperId: string,
+    status: 'playing' | 'paused' | 'error',
+) {
+    return {
+        targetId,
+        mode: 'independent' as const,
+        displayIds: [displayId],
+        wallpaperId,
+        status,
+        muted: true,
+        volume: 0,
+        pauseReasons: status === 'paused' ? ['manual' as const] : [],
+    };
+}
+
+function display(id: string, primary: boolean) {
+    return {
+        id,
+        name: id,
+        x: primary ? 0 : 1920,
+        y: 0,
+        width: 1920,
+        height: 1080,
+        primary,
+        connected: true,
     };
 }

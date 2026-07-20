@@ -18,10 +18,27 @@ describe('Figma style contract', () => {
     });
 
     it('keeps Figma action and selection colors', () => {
+        expect(css).toContain('--text-muted: #7d85a3;');
         expect(css).toContain('.wallpaper-card.active { border: 2px solid var(--accent);');
         expect(css).toContain('.segmented button.active { color: var(--text-primary); background: var(--accent);');
         expect(css).toContain('.danger { background: var(--danger);');
         expect(css).toContain('.button-medium { min-height: 40px; padding: 0 16px;');
+        expect(css).toContain(
+            '.card-quick-play { position: absolute; top: 10px; right: 10px; width: 36px; height: 36px;',
+        );
+    });
+
+    it('keeps the Figma detail layout inside the 1280 by 800 window', () => {
+        expect(css).toContain('.detail-grid { display: grid; grid-template-columns: 620px 384px; gap: 20px; }');
+        expect(css).toContain('.media-preview { position: relative; height: 324px;');
+        expect(css).toContain('.detail-card { height: 324px;');
+        expect(css).toContain('.detail-settings { height: 280px;');
+        expect(css).toContain(
+            '.detail-settings-primary { display: grid; grid-template-columns: 360px 190px 190px 184px; gap: 20px;',
+        );
+        expect(css).toContain(
+            '.detail-settings-video { display: grid; grid-template-columns: 180px 180px 584px; gap: 20px;',
+        );
     });
 
     it('prevents text selection outside inputs', () => {
@@ -29,5 +46,9 @@ describe('Figma style contract', () => {
             '.app-window { width: 100%; height: 100%; background: var(--surface-canvas); user-select: none;',
         );
         expect(css).toContain('input { user-select: text;');
+    });
+
+    it('locks background scrolling while a modal dialog is open', () => {
+        expect(css).toContain('html:has(.modal-scrim) .main-content { overflow: hidden; }');
     });
 });

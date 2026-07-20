@@ -5,6 +5,7 @@ use crate::model::{
     AppError, AppSettings, AppSnapshot, Category, DisplayAssignment, DisplayInfo, DisplayMode,
     PauseReason, PlaybackStatus, ScaleMode, WallpaperItem, WallpaperSettings,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub struct WallCore {
@@ -290,6 +291,60 @@ impl WallCore {
         Ok(())
     }
 
+    /// 同时切换使用指定壁纸的全部目标的手动暂停原因，并返回新的手动暂停状态。
+    pub fn toggle_media_pause(&mut self, media_id: &str) -> Result<bool, AppError> {
+        let matching_count = self
+            .snapshot
+            .playback
+            .display_assignments
+            .iter()
+            .filter(|assignment| assignment.wallpaper_id == media_id)
+            .count();
+        if matching_count > 0 {
+            let paused = !self
+                .snapshot
+                .playback
+                .display_assignments
+                .iter()
+                .filter(|assignment| assignment.wallpaper_id == media_id)
+                .all(|assignment| assignment.pause_reasons.contains(&PauseReason::Manual));
+            for assignment in self
+                .snapshot
+                .playback
+                .display_assignments
+                .iter_mut()
+                .filter(|assignment| assignment.wallpaper_id == media_id)
+            {
+                if paused && !assignment.pause_reasons.contains(&PauseReason::Manual) {
+                    assignment.pause_reasons.push(PauseReason::Manual);
+                } else if !paused {
+                    assignment
+                        .pause_reasons
+                        .retain(|reason| *reason != PauseReason::Manual);
+                }
+                assignment.status = if assignment.pause_reasons.is_empty() {
+                    PlaybackStatus::Playing
+                } else {
+                    PlaybackStatus::Paused
+                };
+            }
+            self.refresh_aggregate_playback();
+            return Ok(paused);
+        }
+        if self.snapshot.playback.active_id.as_deref() == Some(media_id) {
+            let paused = !self
+                .snapshot
+                .playback
+                .pause_reasons
+                .contains(&PauseReason::Manual);
+            self.snapshot
+                .playback
+                .set_pause(PauseReason::Manual, paused);
+            return Ok(paused);
+        }
+        Err(error("no_wallpaper", "这张壁纸当前没有运行目标"))
+    }
+
     /// 添加或移除单个显示目标的自动暂停原因。
     pub fn set_target_pause_reason(
         &mut self,
@@ -425,6 +480,24 @@ impl WallCore {
         Ok(())
     }
 
+    /// 同时停止使用指定壁纸的全部显示目标，并保留其他壁纸的目标。
+    pub fn stop_media_playback(&mut self, media_id: &str) -> Result<(), AppError> {
+        let length = self.snapshot.playback.display_assignments.len();
+        self.snapshot
+            .playback
+            .display_assignments
+            .retain(|assignment| assignment.wallpaper_id != media_id);
+        if self.snapshot.playback.display_assignments.len() != length {
+            self.refresh_aggregate_playback();
+            return Ok(());
+        }
+        if self.snapshot.playback.active_id.as_deref() == Some(media_id) {
+            self.stop();
+            return Ok(());
+        }
+        Err(error("no_wallpaper", "这张壁纸当前没有运行目标"))
+    }
+
     /// 更新全屏、电池或休眠等暂停来源。
     pub fn set_pause_reason(&mut self, reason: PauseReason, paused: bool) {
         self.snapshot.playback.set_pause(reason, paused);
@@ -491,21 +564,54 @@ impl WallCore {
         Ok(())
     }
 
+    /// 重新检查全部媒体路径并返回当前失效项目标识。
+    pub fn refresh_missing(&mut self) -> Vec<String> {
+        for item in &mut self.snapshot.library {
+            item.missing = !Path::new(&item.path).is_file();
+        }
+        self.snapshot
+            .library
+            .iter()
+            .filter(|item| item.missing)
+            .map(|item| item.id.clone())
+            .collect()
+    }
+
     /// 从媒体库移除项目；移除当前项目时同时停止播放。
     pub fn remove(&mut self, id: &str) -> Result<(), AppError> {
-        let length = self.snapshot.library.len();
-        self.snapshot.library.retain(|item| item.id != id);
-        if self.snapshot.library.len() == length {
+        self.remove_many(&[id.to_owned()])
+    }
+
+    /// 原子地移除多个媒体库记录和对应播放分配，不修改任何源文件。
+    pub fn remove_many(&mut self, ids: &[String]) -> Result<(), AppError> {
+        if ids.is_empty() {
+            return Err(error("invalid_selection", "至少选择一张壁纸"));
+        }
+        let requested = ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        if requested
+            .iter()
+            .any(|id| !self.snapshot.library.iter().any(|item| item.id == *id))
+        {
             return Err(error("wallpaper_not_found", "壁纸不在媒体库中"));
         }
+
+        self.snapshot
+            .library
+            .retain(|item| !requested.contains(item.id.as_str()));
         let had_assignments = !self.snapshot.playback.display_assignments.is_empty();
         self.snapshot
             .playback
             .display_assignments
-            .retain(|assignment| assignment.wallpaper_id != id);
+            .retain(|assignment| !requested.contains(assignment.wallpaper_id.as_str()));
         if had_assignments {
             self.refresh_aggregate_playback();
-        } else if self.snapshot.playback.active_id.as_deref() == Some(id) {
+        } else if self
+            .snapshot
+            .playback
+            .active_id
+            .as_deref()
+            .is_some_and(|id| requested.contains(id))
+        {
             self.stop();
         }
         Ok(())
@@ -646,6 +752,9 @@ fn normalized_category_name(name: &str) -> Result<String, AppError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(error("invalid_category_name", "分类名称不能为空"));
+    }
+    if name.chars().count() > 40 {
+        return Err(error("invalid_category_name", "分类名称最多 40 个字符"));
     }
     Ok(name.to_owned())
 }

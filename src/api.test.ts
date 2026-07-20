@@ -21,10 +21,15 @@ import {
     play,
     relocateMedia,
     removeMedia,
+    removeMediaBatch,
+    removeMissingMedia,
     renameCategory,
+    scanLibrary,
     setCategoryMembership,
     setDisplayLayout,
     setWallpaperSettings,
+    stopMedia,
+    toggleMediaPause,
 } from './api';
 
 describe('Tauri command contract', () => {
@@ -68,6 +73,18 @@ describe('Tauri command contract', () => {
         expect(invokeMock).toHaveBeenNthCalledWith(4, 'delete_category', { categoryId: 'nature' });
     });
 
+    it('uses snapshot commands for scanning and library-only removal', async () => {
+        await scanLibrary();
+        await removeMediaBatch(['video-1', 'video-2']);
+        await removeMissingMedia();
+
+        expect(invokeMock).toHaveBeenNthCalledWith(1, 'scan_library', undefined);
+        expect(invokeMock).toHaveBeenNthCalledWith(2, 'remove_media_batch', {
+            mediaIds: ['video-1', 'video-2'],
+        });
+        expect(invokeMock).toHaveBeenNthCalledWith(3, 'remove_missing_media', undefined);
+    });
+
     it('updates one wallpaper override with the shared settings contract', async () => {
         await setWallpaperSettings('video-1', { frameRate: 24, muted: false });
 
@@ -84,6 +101,14 @@ describe('Tauri command contract', () => {
             mode: 'span',
             displayIds: ['left', 'right'],
         });
+    });
+
+    it('controls every target using one wallpaper-scoped command', async () => {
+        await toggleMediaPause('video-1');
+        await stopMedia('video-1');
+
+        expect(invokeMock).toHaveBeenNthCalledWith(1, 'toggle_media_pause', { mediaId: 'video-1' });
+        expect(invokeMock).toHaveBeenNthCalledWith(2, 'stop_media', { mediaId: 'video-1' });
     });
 });
 

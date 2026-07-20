@@ -114,19 +114,797 @@ impl RuntimeState {
             .map_err(|_| error("player_poisoned", "播放器状态暂时不可用", true))
     }
 
-    fn commit(
-        &self,
-        _app: &AppHandle,
-        core: MutexGuard<'_, WallCore>,
-    ) -> Result<AppSnapshot, AppError> {
-        let snapshot = persist_snapshot(&self.core, core, &self.commit_gate, |value| {
-            self.storage
-                .save(value)
-                .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
-            self.publisher.publish(value.clone())
-        })?;
+    /// 在候选状态中执行纯业务变更，只有持久化成功后才替换共享状态。
+    fn commit_core_change<T, F>(&self, mutate: F) -> Result<(AppSnapshot, T), AppError>
+    where
+        F: FnOnce(&mut WallCore) -> Result<T, AppError>,
+    {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let mut candidate = WallCore::new(shared_core.snapshot().clone());
+        let output = mutate(&mut candidate)?;
+        self.storage
+            .save(candidate.snapshot())
+            .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok((snapshot, output))
+    }
+
+    /// 在候选状态中提交暂停原因，并在播放器或存储失败时恢复全部已应用目标。
+    fn commit_pause_change<F>(&self, mutate: F) -> Result<AppSnapshot, AppError>
+    where
+        F: FnOnce(&mut WallCore) -> Result<(), AppError>,
+    {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        mutate(&mut candidate)?;
+        if candidate.snapshot() == &before {
+            return Ok(before);
+        }
+
+        let mut player = self.player()?;
+        let target_changes = online_pause_transitions(
+            pause_transitions(
+                &before.playback.display_assignments,
+                &candidate.snapshot().playback.display_assignments,
+            ),
+            |target_id| player.has_target(target_id),
+        )
+        .into_iter()
+        .filter_map(|(target_id, requested)| {
+            before
+                .playback
+                .display_assignments
+                .iter()
+                .find(|assignment| assignment.target_id == target_id)
+                .map(|assignment| {
+                    (
+                        target_id,
+                        assignment.status == crate::model::PlaybackStatus::Paused,
+                        requested,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+        let legacy_change = (before.playback.display_assignments.is_empty()
+            && candidate.snapshot().playback.display_assignments.is_empty())
+        .then(|| {
+            (
+                before.playback.is_paused(),
+                candidate.snapshot().playback.is_paused(),
+            )
+        })
+        .filter(|(previous, requested)| previous != requested);
+        let mut applied_targets = Vec::new();
+        for (target_id, previous, requested) in &target_changes {
+            if let Err(problem) = player.set_target_paused(target_id, *requested) {
+                let mut rollback_targets = applied_targets.clone();
+                rollback_targets.push((target_id.clone(), *previous));
+                if !rollback_media_pause(&mut player, &rollback_targets, None) {
+                    player.stop();
+                    self.log_error("pause_rollback", "播放器暂停状态回滚失败，已停止全部目标");
+                }
+                return Err(player_error(problem));
+            }
+            applied_targets.push((target_id.clone(), *previous));
+        }
+        let mut applied_legacy = None;
+        if let Some((previous, requested)) = legacy_change {
+            if let Err(problem) = player.set_paused(requested) {
+                let restored = rollback_media_pause(&mut player, &applied_targets, Some(previous));
+                if !restored {
+                    player.stop();
+                    self.log_error("pause_rollback", "播放器暂停状态回滚失败，已停止全部目标");
+                }
+                return Err(player_error(problem));
+            }
+            applied_legacy = Some(previous);
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if !rollback_media_pause(&mut player, &applied_targets, applied_legacy) {
+                player.stop();
+                self.log_error(
+                    "pause_rollback",
+                    "持久化失败后无法恢复播放器，已停止全部目标",
+                );
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
         Ok(snapshot)
     }
+
+    /// 提交带可回滚播放器副作用的候选状态。
+    fn commit_player_change<M, P, A, R>(
+        &self,
+        mutate: M,
+        should_apply: P,
+        apply: A,
+        rollback: R,
+    ) -> Result<AppSnapshot, AppError>
+    where
+        M: FnOnce(&mut WallCore) -> Result<(), AppError>,
+        P: FnOnce(&AppSnapshot) -> bool,
+        A: FnOnce(&mut MpvPlayerManager, &AppSnapshot) -> Result<(), PlayerError>,
+        R: FnOnce(&mut MpvPlayerManager, &AppSnapshot) -> Result<(), PlayerError>,
+    {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        mutate(&mut candidate)?;
+        if candidate.snapshot() == &before {
+            return Ok(before);
+        }
+        if !should_apply(candidate.snapshot()) {
+            self.storage
+                .save(candidate.snapshot())
+                .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
+            *shared_core = candidate;
+            let snapshot = shared_core.snapshot().clone();
+            if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+                self.log_error("publish", &problem.message);
+            }
+            return Ok(snapshot);
+        }
+
+        let mut player = self.player()?;
+        let mut rollback = Some(rollback);
+        if let Err(problem) = apply(&mut player, candidate.snapshot()) {
+            if rollback
+                .take()
+                .is_some_and(|restore| restore(&mut player, &before).is_err())
+            {
+                player.stop();
+                self.log_error("player_rollback", "播放器状态回滚失败，已停止全部目标");
+            }
+            return Err(player_error(problem));
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if rollback
+                .take()
+                .is_some_and(|restore| restore(&mut player, &before).is_err())
+            {
+                player.stop();
+                self.log_error(
+                    "player_rollback",
+                    "持久化失败后无法恢复播放器，已停止全部目标",
+                );
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        drop(player);
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 提交已持久化后即可安全执行的停止操作。
+    fn commit_stop_change<M, S>(&self, mutate: M, stop_player: S) -> Result<AppSnapshot, AppError>
+    where
+        M: FnOnce(&mut WallCore) -> Result<(), AppError>,
+        S: FnOnce(&mut MpvPlayerManager),
+    {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        mutate(&mut candidate)?;
+        if candidate.snapshot() == &before {
+            return Ok(before);
+        }
+        let mut player = self.player()?;
+        self.storage
+            .save(candidate.snapshot())
+            .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
+        stop_player(&mut player);
+        drop(player);
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    fn commit_muted(&self, muted: bool) -> Result<AppSnapshot, AppError> {
+        self.commit_player_change(
+            |core| {
+                core.set_muted(muted);
+                Ok(())
+            },
+            |snapshot| snapshot.playback.active_id.is_some(),
+            |player, _| player.set_muted(muted),
+            recover_playback_audio,
+        )
+    }
+
+    fn commit_target_muted(&self, target_id: &str, muted: bool) -> Result<AppSnapshot, AppError> {
+        self.commit_player_change(
+            |core| core.set_target_muted(target_id, muted),
+            |_| true,
+            |player, _| {
+                if player.has_target(target_id) {
+                    player.set_target_muted(target_id, muted)?;
+                }
+                Ok(())
+            },
+            |player, snapshot| restore_target_audio(player, snapshot, target_id),
+        )
+    }
+
+    fn commit_volume(&self, volume: u8) -> Result<AppSnapshot, AppError> {
+        self.commit_player_change(
+            |core| core.set_volume(volume),
+            |snapshot| snapshot.playback.active_id.is_some(),
+            |player, _| player.set_volume(volume),
+            recover_playback_audio,
+        )
+    }
+
+    fn commit_scale_mode(&self, mode: ScaleMode) -> Result<AppSnapshot, AppError> {
+        self.commit_player_change(
+            |core| {
+                core.set_scale_mode(mode);
+                Ok(())
+            },
+            |snapshot| snapshot.playback.active_id.is_some(),
+            |player, snapshot| player.set_scale_mode(&snapshot.settings),
+            |player, snapshot| player.set_scale_mode(&snapshot.settings),
+        )
+    }
+
+    /// 在候选状态中启动壁纸，并在播放器或存储失败时恢复此前播放快照。
+    fn commit_play(&self, media_id: &str) -> Result<AppSnapshot, AppError> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        candidate.play(media_id)?;
+        let item = candidate
+            .snapshot()
+            .library
+            .iter()
+            .find(|item| item.id == media_id)
+            .cloned()
+            .ok_or_else(|| error("wallpaper_not_found", "壁纸不在媒体库中", true))?;
+        let settings = candidate.effective_settings(media_id)?;
+        let assignment = candidate
+            .snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .rev()
+            .find(|assignment| assignment.wallpaper_id == media_id)
+            .cloned();
+        let mut player = self.player()?;
+        let restore_plan =
+            build_player_restore_plan(&before, |target_id| player.has_target(target_id));
+        let play_result = if let Some(assignment) = assignment {
+            start_assignment_player(&mut player, &self.mpv_binary, &candidate, &assignment)
+        } else {
+            player
+                .play(
+                    media_id,
+                    &self.mpv_binary,
+                    Path::new(&item.path),
+                    item.kind,
+                    &settings,
+                )
+                .map_err(player_error)
+        };
+        if let Err(problem) = play_result {
+            self.log_error("play", &problem.message);
+            if !restore_player_snapshot(&mut player, &self.mpv_binary, &before, &restore_plan) {
+                player.stop();
+                self.log_error("play_rollback", "播放器回滚失败，已停止全部目标");
+            }
+            return Err(problem);
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if !restore_player_snapshot(&mut player, &self.mpv_binary, &before, &restore_plan) {
+                player.stop();
+                self.log_error(
+                    "play_rollback",
+                    "持久化失败后无法恢复播放器，已停止全部目标",
+                );
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        drop(player);
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 在候选状态中刷新显示器与播放器目标，并在存储失败时恢复此前播放快照。
+    fn commit_display_refresh(&self, displays: Vec<DisplayInfo>) -> Result<AppSnapshot, AppError> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        candidate.set_displays(displays);
+        let mut player = self.player()?;
+        let mut restore_plan =
+            build_player_restore_plan(&before, |target_id| player.has_target(target_id));
+        let exited = match player.take_exited_targets() {
+            Ok(targets) => targets,
+            Err(problem) => {
+                if !restore_player_snapshot(&mut player, &self.mpv_binary, &before, &restore_plan) {
+                    player.stop();
+                    self.log_error("display_rollback", "显示目标检查失败且播放器无法恢复");
+                }
+                return Err(player_error(problem));
+            }
+        };
+        for target_id in exited {
+            restore_plan
+                .target_ids
+                .retain(|running_id| running_id != &target_id);
+            let _ = candidate
+                .set_target_error(&target_id, "mpv 子进程意外退出，正在尝试恢复".to_owned());
+        }
+        let assignments = candidate.snapshot().playback.display_assignments.clone();
+        for assignment in assignments {
+            let connected = assignment.display_ids.iter().all(|id| {
+                candidate
+                    .snapshot()
+                    .displays
+                    .iter()
+                    .any(|display| &display.id == id && display.connected)
+            });
+            let running = player.has_target(&assignment.target_id);
+            if !connected && running {
+                player.stop_target(&assignment.target_id);
+            } else if connected && !running {
+                match start_assignment_player(
+                    &mut player,
+                    &self.mpv_binary,
+                    &candidate,
+                    &assignment,
+                ) {
+                    Ok(()) => {
+                        if let Err(problem) = candidate.restore_target_status(&assignment.target_id)
+                        {
+                            if !restore_player_snapshot(
+                                &mut player,
+                                &self.mpv_binary,
+                                &before,
+                                &restore_plan,
+                            ) {
+                                player.stop();
+                                self.log_error(
+                                    "display_rollback",
+                                    "显示目标状态无效且播放器无法恢复",
+                                );
+                            }
+                            return Err(problem);
+                        }
+                    }
+                    Err(problem) => {
+                        self.log_error("display_restore", &problem.message);
+                        if let Err(state_problem) =
+                            candidate.set_target_error(&assignment.target_id, problem.message)
+                        {
+                            if !restore_player_snapshot(
+                                &mut player,
+                                &self.mpv_binary,
+                                &before,
+                                &restore_plan,
+                            ) {
+                                player.stop();
+                                self.log_error(
+                                    "display_rollback",
+                                    "显示目标错误状态无效且播放器无法恢复",
+                                );
+                            }
+                            return Err(state_problem);
+                        }
+                    }
+                }
+            }
+        }
+        if candidate.snapshot() == &before {
+            return Ok(before);
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if !restore_player_snapshot(&mut player, &self.mpv_binary, &before, &restore_plan) {
+                player.stop();
+                self.log_error("display_rollback", "显示状态持久化失败且播放器无法恢复");
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        drop(player);
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 在共享状态外构建媒体库候选快照，持久化成功后再切换状态并停止已移除媒体。
+    fn commit_library_change<F>(&self, mutate: F) -> Result<AppSnapshot, AppError>
+    where
+        F: FnOnce(&mut WallCore) -> Result<Vec<String>, AppError>,
+    {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let mut candidate = WallCore::new(shared_core.snapshot().clone());
+        let removed_media_ids = mutate(&mut candidate)?;
+        let mut player = if removed_media_ids.is_empty() {
+            None
+        } else {
+            Some(self.player()?)
+        };
+        self.storage
+            .save(candidate.snapshot())
+            .map_err(|problem| error("storage_failed", &problem.to_string(), true))?;
+        if let Some(player) = player.as_mut() {
+            for media_id in &removed_media_ids {
+                player.stop_media(media_id);
+            }
+        }
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 原子地切换一张壁纸的全部显示目标，并在持久化失败时恢复播放器状态。
+    fn commit_media_pause(&self, media_id: &str) -> Result<AppSnapshot, AppError> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let before = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(before.clone());
+        candidate.toggle_media_pause(media_id)?;
+        let target_changes = candidate
+            .snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .filter(|assignment| assignment.wallpaper_id == media_id)
+            .filter_map(|assignment| {
+                before
+                    .playback
+                    .display_assignments
+                    .iter()
+                    .find(|previous| previous.target_id == assignment.target_id)
+                    .map(|previous| {
+                        (
+                            assignment.target_id.clone(),
+                            previous.status == crate::model::PlaybackStatus::Paused,
+                            assignment.status == crate::model::PlaybackStatus::Paused,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let legacy_change = target_changes.is_empty().then(|| {
+            (
+                before.playback.is_paused(),
+                candidate.snapshot().playback.is_paused(),
+            )
+        });
+        let mut player = self.player()?;
+        let mut applied_targets = Vec::new();
+        for (target_id, previous, requested) in &target_changes {
+            if !player.has_target(target_id) {
+                continue;
+            }
+            if let Err(problem) = player.set_target_paused(target_id, *requested) {
+                let mut rollback_targets = applied_targets.clone();
+                rollback_targets.push((target_id.clone(), *previous));
+                if !rollback_media_pause(&mut player, &rollback_targets, None) {
+                    player.stop_media(media_id);
+                    self.log_error("pause_rollback", "播放器暂停状态回滚失败，已停止相关目标");
+                }
+                return Err(player_error(problem));
+            }
+            applied_targets.push((target_id.clone(), *previous));
+        }
+        let mut applied_legacy = None;
+        if let Some((previous, requested)) = legacy_change {
+            if let Err(problem) = player.set_paused(requested) {
+                let _ = player.set_paused(previous);
+                return Err(player_error(problem));
+            }
+            applied_legacy = Some(previous);
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if !rollback_media_pause(&mut player, &applied_targets, applied_legacy) {
+                player.stop_media(media_id);
+                self.log_error(
+                    "pause_rollback",
+                    "持久化失败后无法恢复播放器，已停止相关目标",
+                );
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 原子地停止一张壁纸的全部目标，并保留其他壁纸的播放状态。
+    fn commit_media_stop(&self, media_id: &str) -> Result<AppSnapshot, AppError> {
+        self.commit_stop_change(
+            |core| core.stop_media_playback(media_id),
+            |player| player.stop_media(media_id),
+        )
+    }
+
+    /// 原子地保存全局设置，并在持久化或播放器更新失败时恢复外部状态。
+    fn commit_settings(
+        &self,
+        app: &AppHandle,
+        settings: AppSettings,
+    ) -> Result<AppSnapshot, AppError> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let previous_snapshot = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(previous_snapshot.clone());
+        let mut running_media_ids = candidate
+            .snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .map(|assignment| assignment.wallpaper_id.clone())
+            .collect::<Vec<_>>();
+        if let Some(id) = &candidate.snapshot().playback.active_id
+            && !running_media_ids.contains(id)
+        {
+            running_media_ids.push(id.clone());
+        }
+        running_media_ids.sort();
+        running_media_ids.dedup();
+        let previous_effective_settings = running_media_ids
+            .iter()
+            .filter_map(|id| {
+                candidate
+                    .effective_settings(id)
+                    .ok()
+                    .map(|value| (id.clone(), value))
+            })
+            .collect::<Vec<_>>();
+        candidate.update_settings(settings.clone())?;
+        let effective_settings = running_media_ids
+            .iter()
+            .filter_map(|id| {
+                candidate
+                    .effective_settings(id)
+                    .ok()
+                    .map(|value| (id.clone(), value))
+            })
+            .collect::<Vec<_>>();
+        for (media_id, effective) in &effective_settings {
+            candidate.set_media_playback_settings(
+                media_id,
+                effective.default_muted,
+                effective.volume,
+            )?;
+        }
+        let mut player = if effective_settings.is_empty() {
+            None
+        } else {
+            Some(self.player()?)
+        };
+        let previous_auto_start = previous_snapshot.settings.auto_start;
+        let auto_start_updated = sync_autostart(app, previous_auto_start, settings.auto_start)?;
+        if let Some(player) = player.as_mut() {
+            for (media_id, effective) in &effective_settings {
+                let assignments = candidate
+                    .snapshot()
+                    .playback
+                    .display_assignments
+                    .iter()
+                    .filter(|assignment| assignment.wallpaper_id == *media_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Err(problem) =
+                    apply_media_runtime_settings(player, media_id, effective, &assignments)
+                {
+                    recover_settings_side_effects(
+                        player,
+                        &previous_effective_settings,
+                        &previous_snapshot,
+                    );
+                    if auto_start_updated {
+                        restore_autostart(app, previous_auto_start);
+                    }
+                    return Err(player_error(problem));
+                }
+            }
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if let Some(player) = player.as_mut() {
+                recover_settings_side_effects(
+                    player,
+                    &previous_effective_settings,
+                    &previous_snapshot,
+                );
+            }
+            if auto_start_updated {
+                restore_autostart(app, previous_auto_start);
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+
+    /// 原子地保存壁纸覆盖设置，并在失败时恢复该壁纸的播放器配置。
+    fn commit_wallpaper_settings(
+        &self,
+        media_id: &str,
+        settings: WallpaperSettings,
+    ) -> Result<AppSnapshot, AppError> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
+        let mut shared_core = self.core()?;
+        let previous_snapshot = shared_core.snapshot().clone();
+        let mut candidate = WallCore::new(previous_snapshot.clone());
+        let previous_effective = candidate.effective_settings(media_id)?;
+        candidate.update_wallpaper_settings(media_id, settings)?;
+        let effective = candidate.effective_settings(media_id)?;
+        let assignments = candidate
+            .snapshot()
+            .playback
+            .display_assignments
+            .iter()
+            .filter(|assignment| assignment.wallpaper_id == media_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let is_running = !assignments.is_empty()
+            || candidate.snapshot().playback.active_id.as_deref() == Some(media_id);
+        if is_running {
+            candidate.set_media_playback_settings(
+                media_id,
+                effective.default_muted,
+                effective.volume,
+            )?;
+        }
+        let mut player = if is_running {
+            Some(self.player()?)
+        } else {
+            None
+        };
+        if let Some(player) = player.as_mut()
+            && let Err(problem) =
+                apply_media_runtime_settings(player, media_id, &effective, &assignments)
+        {
+            recover_wallpaper_settings_side_effect(
+                player,
+                media_id,
+                &previous_effective,
+                &previous_snapshot,
+            );
+            return Err(player_error(problem));
+        }
+        if let Err(problem) = self.storage.save(candidate.snapshot()) {
+            if let Some(player) = player.as_mut() {
+                recover_wallpaper_settings_side_effect(
+                    player,
+                    media_id,
+                    &previous_effective,
+                    &previous_snapshot,
+                );
+            }
+            return Err(error("storage_failed", &problem.to_string(), true));
+        }
+        *shared_core = candidate;
+        let snapshot = shared_core.snapshot().clone();
+        if let Err(problem) = self.publisher.publish(snapshot.clone()) {
+            self.log_error("publish", &problem.message);
+        }
+        Ok(snapshot)
+    }
+}
+
+fn rollback_media_pause(
+    player: &mut MpvPlayerManager,
+    targets: &[(String, bool)],
+    legacy: Option<bool>,
+) -> bool {
+    let mut restored = true;
+    for (target_id, paused) in targets.iter().rev() {
+        restored &= player.set_target_paused(target_id, *paused).is_ok();
+    }
+    if let Some(paused) = legacy {
+        restored &= player.set_paused(paused).is_ok();
+    }
+    restored
+}
+
+fn recover_playback_audio(
+    player: &mut MpvPlayerManager,
+    snapshot: &AppSnapshot,
+) -> Result<(), PlayerError> {
+    if snapshot.playback.display_assignments.is_empty() {
+        player.set_muted(snapshot.playback.muted)?;
+        player.set_volume(snapshot.playback.volume)?;
+        return Ok(());
+    }
+    for assignment in &snapshot.playback.display_assignments {
+        if player.has_target(&assignment.target_id) {
+            player.set_target_muted(&assignment.target_id, assignment.muted)?;
+            player.set_target_volume(&assignment.target_id, assignment.volume)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_target_audio(
+    player: &mut MpvPlayerManager,
+    snapshot: &AppSnapshot,
+    target_id: &str,
+) -> Result<(), PlayerError> {
+    let Some(assignment) = snapshot
+        .playback
+        .display_assignments
+        .iter()
+        .find(|assignment| assignment.target_id == target_id)
+    else {
+        return Ok(());
+    };
+    if player.has_target(target_id) {
+        player.set_target_muted(target_id, assignment.muted)?;
+        player.set_target_volume(target_id, assignment.volume)?;
+    }
+    Ok(())
 }
 
 fn write_log(data_dir: &Path, context: &str, message: &str) {
@@ -146,38 +924,6 @@ fn write_log(data_dir: &Path, context: &str, message: &str) {
         .map(|value| value.as_secs())
         .unwrap_or_default();
     let _ = writeln!(file, "{timestamp} [{context}] {message}");
-}
-
-fn prepare_commit<'a>(
-    core_mutex: &Mutex<WallCore>,
-    core: MutexGuard<'_, WallCore>,
-    commit_gate: &'a Mutex<()>,
-) -> Result<(AppSnapshot, MutexGuard<'a, ()>), AppError> {
-    drop(core);
-    let commit_guard = commit_gate
-        .lock()
-        .map_err(|_| error("commit_poisoned", "应用状态暂时无法提交", true))?;
-    let snapshot = core_mutex
-        .lock()
-        .map_err(|_| error("state_poisoned", "应用状态暂时不可用", false))?
-        .snapshot()
-        .clone();
-    Ok((snapshot, commit_guard))
-}
-
-fn persist_snapshot<F>(
-    core_mutex: &Mutex<WallCore>,
-    core: MutexGuard<'_, WallCore>,
-    commit_gate: &Mutex<()>,
-    persist: F,
-) -> Result<AppSnapshot, AppError>
-where
-    F: FnOnce(&AppSnapshot) -> Result<(), AppError>,
-{
-    let (snapshot, commit_guard) = prepare_commit(core_mutex, core, commit_gate)?;
-    persist(&snapshot)?;
-    drop(commit_guard);
-    Ok(snapshot)
 }
 
 fn discard_disabled_session(snapshot: &mut AppSnapshot) -> bool {
@@ -201,14 +947,16 @@ pub fn import_media(
     state: State<'_, RuntimeState>,
     paths: Vec<String>,
 ) -> Result<Vec<WallpaperItem>, AppError> {
-    let mut core = state.core()?;
-    let imported = core.import_paths(&paths.into_iter().map(PathBuf::from).collect::<Vec<_>>())?;
-    for item in &imported {
-        app.asset_protocol_scope()
-            .allow_file(&item.path)
-            .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
-    }
-    state.commit(&app, core)?;
+    let (_, imported) = state.commit_core_change(|core| {
+        let imported =
+            core.import_paths(&paths.into_iter().map(PathBuf::from).collect::<Vec<_>>())?;
+        for item in &imported {
+            app.asset_protocol_scope()
+                .allow_file(&item.path)
+                .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
+        }
+        Ok(imported)
+    })?;
     Ok(imported)
 }
 
@@ -249,119 +997,129 @@ fn collect_displays(app: &AppHandle) -> tauri::Result<Vec<DisplayInfo>> {
 pub fn refresh_displays(app: AppHandle, state: State<'_, RuntimeState>) -> Result<(), AppError> {
     let displays = collect_displays(&app)
         .map_err(|problem| error("display_enumeration_failed", &problem.to_string(), true))?;
-    let mut core = state.core()?;
-    let before = core.snapshot().clone();
-    core.set_displays(displays);
-    let exited = state
-        .player()?
-        .take_exited_targets()
-        .map_err(player_error)?;
-    for target_id in exited {
-        let _ = core.set_target_error(&target_id, "mpv 子进程意外退出，正在尝试恢复".to_owned());
-    }
-    let assignments = core.snapshot().playback.display_assignments.clone();
-    for assignment in assignments {
-        let connected = assignment.display_ids.iter().all(|id| {
-            core.snapshot()
-                .displays
-                .iter()
-                .any(|display| &display.id == id && display.connected)
-        });
-        let running = state.player()?.has_target(&assignment.target_id);
-        if !connected && running {
-            state.player()?.stop_target(&assignment.target_id);
-        } else if connected && !running {
-            match start_assignment_player(&state, &core, &assignment) {
-                Ok(()) => {
-                    core.restore_target_status(&assignment.target_id)?;
-                }
-                Err(problem) => {
-                    state.log_error("display_restore", &problem.message);
-                    core.set_target_error(&assignment.target_id, problem.message)?;
-                }
-            }
-        }
-    }
-    if core.snapshot() != &before {
-        state.commit(&app, core)?;
-    }
+    state.commit_display_refresh(displays)?;
     Ok(())
 }
 
 /// 创建用户分类并广播更新后的完整快照。
 #[tauri::command]
 pub fn create_category(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     name: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.create_category(&name)?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| core.create_category(&name))
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// 重命名用户分类并保持现有壁纸归属。
 #[tauri::command]
 pub fn rename_category(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     category_id: String,
     name: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.rename_category(&category_id, &name)?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| core.rename_category(&category_id, &name))
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// 删除分类并仅解除归属，不删除媒体项目或源文件。
 #[tauri::command]
 pub fn delete_category(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     category_id: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.delete_category(&category_id)?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| core.delete_category(&category_id))
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// 批量添加或移除壁纸分类，并在提交前验证所有标识。
 #[tauri::command]
 pub fn set_category_membership(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     media_ids: Vec<String>,
     category_id: String,
     assigned: bool,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.set_category_membership(&media_ids, &category_id, assigned)?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| core.set_category_membership(&media_ids, &category_id, assigned))
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// 选择独立、复制或铺展显示器组，并广播最新快照。
 #[tauri::command]
 pub fn set_display_layout(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     mode: DisplayMode,
     display_ids: Vec<String>,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.set_display_layout(mode, display_ids)?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| core.set_display_layout(mode, display_ids))
+        .map(|(snapshot, _)| snapshot)
 }
 
 #[tauri::command]
 pub fn remove_media(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     media_id: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.remove(&media_id)?;
-    state.player()?.stop_media(&media_id);
-    state.commit(&app, core)
+    state.commit_library_change(|core| {
+        core.remove(&media_id)?;
+        Ok(vec![media_id])
+    })
+}
+
+/// 原子地从媒体库移除多个项目，并停止使用这些项目的播放目标。
+#[tauri::command]
+pub fn remove_media_batch(
+    _app: AppHandle,
+    state: State<'_, RuntimeState>,
+    media_ids: Vec<String>,
+) -> Result<AppSnapshot, AppError> {
+    state.commit_library_change(|core| {
+        core.remove_many(&media_ids)?;
+        Ok(media_ids)
+    })
+}
+
+/// 重新扫描全部媒体路径并广播最新失效状态。
+#[tauri::command]
+pub fn scan_library(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<AppSnapshot, AppError> {
+    state.commit_library_change(|core| {
+        core.refresh_missing();
+        for item in core.snapshot().library.iter().filter(|item| !item.missing) {
+            app.asset_protocol_scope()
+                .allow_file(&item.path)
+                .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
+        }
+        Ok(Vec::new())
+    })
+}
+
+/// 重新扫描后移除全部失效记录，不删除或修改任何源文件。
+#[tauri::command]
+pub fn remove_missing_media(
+    _app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<AppSnapshot, AppError> {
+    state.commit_library_change(|core| {
+        let media_ids = core.refresh_missing();
+        if !media_ids.is_empty() {
+            core.remove_many(&media_ids)?;
+        }
+        Ok(media_ids)
+    })
 }
 
 #[tauri::command]
@@ -371,68 +1129,28 @@ pub fn relocate_media(
     media_id: String,
     path: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.relocate(&media_id, Path::new(&path))?;
-    app.asset_protocol_scope()
-        .allow_file(&path)
-        .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))?;
-    state.commit(&app, core)
+    state
+        .commit_core_change(|core| {
+            core.relocate(&media_id, Path::new(&path))?;
+            app.asset_protocol_scope()
+                .allow_file(&path)
+                .map_err(|problem| error("preview_scope_failed", &problem.to_string(), true))
+        })
+        .map(|(snapshot, _)| snapshot)
 }
 
 #[tauri::command]
 pub fn play(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     media_id: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    let previous_snapshot = core.snapshot().clone();
-    let had_active_target = !previous_snapshot.playback.display_assignments.is_empty();
-    core.play(&media_id)?;
-    let item = core
-        .snapshot()
-        .library
-        .iter()
-        .find(|item| item.id == media_id)
-        .cloned()
-        .ok_or_else(|| error("wallpaper_not_found", "壁纸不在媒体库中", true))?;
-    let settings = core.effective_settings(&media_id)?;
-    let assignment = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .rev()
-        .find(|assignment| assignment.wallpaper_id == media_id)
-        .cloned();
-    let result = if let Some(assignment) = assignment {
-        start_assignment_player(&state, &core, &assignment)
-    } else {
-        state
-            .player()?
-            .play(
-                &media_id,
-                &state.mpv_binary,
-                Path::new(&item.path),
-                item.kind,
-                &settings,
-            )
-            .map_err(player_error)
-    };
-    if let Err(app_error) = result {
-        state.log_error("play", &app_error.message);
-        *core = WallCore::new(previous_snapshot);
-        if !had_active_target {
-            core.set_playback_error(app_error.message.clone());
-            state.commit(&app, core)?;
-        }
-        return Err(app_error);
-    }
-    state.commit(&app, core)
+    state.commit_play(&media_id)
 }
 
 fn start_assignment_player(
-    state: &RuntimeState,
+    player: &mut MpvPlayerManager,
+    mpv_binary: &Path,
     core: &WallCore,
     assignment: &DisplayAssignment,
 ) -> Result<(), AppError> {
@@ -462,12 +1180,11 @@ fn start_assignment_player(
     if regions.len() != assignment.display_ids.len() {
         return Err(error("display_offline", "显示目标包含离线屏幕", true));
     }
-    let mut player = state.player()?;
     player
         .play_target_configured(
             &assignment.target_id,
             &assignment.wallpaper_id,
-            &state.mpv_binary,
+            mpv_binary,
             Path::new(&item.path),
             item.kind,
             &settings,
@@ -481,140 +1198,184 @@ fn start_assignment_player(
         .map_err(player_error)
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PlayerRestorePlan {
+    target_ids: Vec<String>,
+    legacy: bool,
+}
+
+fn build_player_restore_plan<F>(snapshot: &AppSnapshot, mut is_running: F) -> PlayerRestorePlan
+where
+    F: FnMut(&str) -> bool,
+{
+    let target_ids = snapshot
+        .playback
+        .display_assignments
+        .iter()
+        .filter(|assignment| {
+            assignment.status != crate::model::PlaybackStatus::Error
+                && is_running(&assignment.target_id)
+        })
+        .map(|assignment| assignment.target_id.clone())
+        .collect();
+    let legacy = snapshot.playback.display_assignments.is_empty()
+        && snapshot.playback.status != crate::model::PlaybackStatus::Error
+        && snapshot.playback.active_id.is_some()
+        && is_running("display:primary");
+    PlayerRestorePlan { target_ids, legacy }
+}
+
+fn restore_player_snapshot(
+    player: &mut MpvPlayerManager,
+    mpv_binary: &Path,
+    snapshot: &AppSnapshot,
+    plan: &PlayerRestorePlan,
+) -> bool {
+    player.stop();
+    let core = WallCore::new(snapshot.clone());
+    if !snapshot.playback.display_assignments.is_empty() {
+        for assignment in &snapshot.playback.display_assignments {
+            if !plan.target_ids.contains(&assignment.target_id) {
+                continue;
+            }
+            let connected = assignment.display_ids.iter().all(|id| {
+                snapshot
+                    .displays
+                    .iter()
+                    .any(|display| &display.id == id && display.connected)
+            });
+            if connected && start_assignment_player(player, mpv_binary, &core, assignment).is_err()
+            {
+                player.stop();
+                return false;
+            }
+        }
+        return true;
+    }
+    if !plan.legacy {
+        return true;
+    }
+    let Some(media_id) = snapshot.playback.active_id.as_deref() else {
+        return true;
+    };
+    let Some(item) = snapshot.library.iter().find(|item| item.id == media_id) else {
+        return false;
+    };
+    let Ok(settings) = core.effective_settings(media_id) else {
+        return false;
+    };
+    if player
+        .play(
+            media_id,
+            mpv_binary,
+            Path::new(&item.path),
+            item.kind,
+            &settings,
+        )
+        .is_err()
+    {
+        player.stop();
+        return false;
+    }
+    true
+}
+
 #[tauri::command]
 pub fn toggle_pause(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.toggle_pause()?;
-    state
-        .player()?
-        .set_paused(core.snapshot().playback.is_paused())
-        .map_err(player_error)?;
-    state.commit(&app, core)
+    state.commit_pause_change(WallCore::toggle_pause)
 }
 
 /// 切换单个显示目标的手动暂停状态。
 #[tauri::command]
 pub fn toggle_target_pause(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     target_id: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.toggle_target_pause(&target_id)?;
-    let paused = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .find(|assignment| assignment.target_id == target_id)
-        .is_some_and(|assignment| assignment.status == crate::model::PlaybackStatus::Paused);
-    let mut player = state.player()?;
-    if player.has_target(&target_id)
-        && let Err(problem) = player.set_target_paused(&target_id, paused)
-    {
-        core.toggle_target_pause(&target_id)?;
-        return Err(player_error(problem));
-    }
-    drop(player);
-    state.commit(&app, core)
+    state.commit_pause_change(|core| core.toggle_target_pause(&target_id))
+}
+
+/// 原子地切换使用指定壁纸的全部目标的手动暂停状态。
+#[tauri::command]
+pub fn toggle_media_pause(
+    state: State<'_, RuntimeState>,
+    media_id: String,
+) -> Result<AppSnapshot, AppError> {
+    state.commit_media_pause(&media_id)
 }
 
 #[tauri::command]
-pub fn stop(app: AppHandle, state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.stop();
-    state.player()?.stop();
-    state.commit(&app, core)
+pub fn stop(_app: AppHandle, state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
+    state.commit_stop_change(
+        |core| {
+            core.stop();
+            Ok(())
+        },
+        MpvPlayerManager::stop,
+    )
 }
 
 #[tauri::command]
 pub fn set_muted(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     muted: bool,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.set_muted(muted);
-    if core.snapshot().playback.active_id.is_some() {
-        state.player()?.set_muted(muted).map_err(player_error)?;
-    }
-    state.commit(&app, core)
+    state.commit_muted(muted)
 }
 
 /// 设置单个显示目标的静音状态。
 #[tauri::command]
 pub fn set_target_muted(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     target_id: String,
     muted: bool,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    let previous = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .find(|assignment| assignment.target_id == target_id)
-        .map(|assignment| assignment.muted)
-        .ok_or_else(|| error("display_target_not_found", "显示目标不存在", true))?;
-    core.set_target_muted(&target_id, muted)?;
-    let mut player = state.player()?;
-    if player.has_target(&target_id)
-        && let Err(problem) = player.set_target_muted(&target_id, muted)
-    {
-        core.set_target_muted(&target_id, previous)?;
-        return Err(player_error(problem));
-    }
-    drop(player);
-    state.commit(&app, core)
+    state.commit_target_muted(&target_id, muted)
 }
 
 /// 停止单个显示目标。
 #[tauri::command]
 pub fn stop_target(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     target_id: String,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.stop_target(&target_id)?;
-    state.player()?.stop_target(&target_id);
-    state.commit(&app, core)
+    state.commit_stop_change(
+        |core| core.stop_target(&target_id),
+        |player| player.stop_target(&target_id),
+    )
+}
+
+/// 原子地停止使用指定壁纸的全部目标。
+#[tauri::command]
+pub fn stop_media(
+    state: State<'_, RuntimeState>,
+    media_id: String,
+) -> Result<AppSnapshot, AppError> {
+    state.commit_media_stop(&media_id)
 }
 
 #[tauri::command]
 pub fn set_volume(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     volume: u8,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.set_volume(volume)?;
-    if core.snapshot().playback.active_id.is_some() {
-        state.player()?.set_volume(volume).map_err(player_error)?;
-    }
-    state.commit(&app, core)
+    state.commit_volume(volume)
 }
 
 #[tauri::command]
 pub fn set_scale_mode(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     mode: ScaleMode,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    core.set_scale_mode(mode);
-    if core.snapshot().playback.active_id.is_some() {
-        state
-            .player()?
-            .set_scale_mode(&core.snapshot().settings)
-            .map_err(player_error)?;
-    }
-    state.commit(&app, core)
+    state.commit_scale_mode(mode)
 }
 
 #[tauri::command]
@@ -626,158 +1387,18 @@ pub fn update_settings(
     if settings.volume > 100 || ![0, 24, 30, 60].contains(&settings.frame_rate) {
         return Err(error("invalid_settings", "音量或帧率设置无效", true));
     }
-    let mut core = state.core()?;
-    let previous_snapshot = core.snapshot().clone();
-    let previous_auto_start = previous_snapshot.settings.auto_start;
-    let auto_start_updated = sync_autostart(&app, previous_auto_start, settings.auto_start)?;
-    let active_id = core.snapshot().playback.active_id.clone();
-    let mut running_media_ids = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .map(|assignment| assignment.wallpaper_id.clone())
-        .collect::<Vec<_>>();
-    if let Some(id) = &active_id
-        && !running_media_ids.contains(id)
-    {
-        running_media_ids.push(id.clone());
-    }
-    running_media_ids.sort();
-    running_media_ids.dedup();
-    let effective_settings = running_media_ids
-        .iter()
-        .filter_map(|id| {
-            core.snapshot()
-                .library
-                .iter()
-                .find(|item| item.id == *id)
-                .map(|item| {
-                    let mut effective = settings.clone();
-                    item.settings.apply_to(&mut effective);
-                    (id.clone(), effective)
-                })
-        })
-        .collect::<Vec<_>>();
-    let previous_effective_settings = running_media_ids
-        .iter()
-        .filter_map(|id| {
-            core.effective_settings(id)
-                .ok()
-                .map(|value| (id.clone(), value))
-        })
-        .collect::<Vec<_>>();
-    if !effective_settings.is_empty() {
-        let mut player = state.player()?;
-        for (media_id, effective) in &effective_settings {
-            let assignments = core
-                .snapshot()
-                .playback
-                .display_assignments
-                .iter()
-                .filter(|assignment| assignment.wallpaper_id == *media_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            if let Err(problem) =
-                apply_media_runtime_settings(&mut player, media_id, effective, &assignments)
-            {
-                let app_error = player_error(problem);
-                for (rollback_id, rollback_settings) in &previous_effective_settings {
-                    let rollback_assignments = previous_snapshot
-                        .playback
-                        .display_assignments
-                        .iter()
-                        .filter(|assignment| assignment.wallpaper_id == *rollback_id)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let _ = apply_media_runtime_settings(
-                        &mut player,
-                        rollback_id,
-                        rollback_settings,
-                        &rollback_assignments,
-                    );
-                }
-                if auto_start_updated {
-                    restore_autostart(&app, previous_auto_start);
-                }
-                *core = WallCore::new(previous_snapshot);
-                return Err(app_error);
-            }
-            core.set_media_playback_settings(media_id, effective.default_muted, effective.volume)?;
-        }
-    }
-    if core.snapshot().playback.display_assignments.is_empty()
-        && let Some((_, effective)) = effective_settings
-            .iter()
-            .find(|(id, _)| Some(id) == active_id.as_ref())
-    {
-        core.set_muted(effective.default_muted);
-        core.set_volume(effective.volume)?;
-    }
-    core.update_settings(settings)?;
-    state.commit(&app, core)
+    state.commit_settings(&app, settings)
 }
 
 /// 更新单张壁纸覆盖项，并在该壁纸运行时实时应用有效设置。
 #[tauri::command]
 pub fn set_wallpaper_settings(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     media_id: String,
     settings: WallpaperSettings,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    let previous_snapshot = core.snapshot().clone();
-    let previous = core
-        .snapshot()
-        .library
-        .iter()
-        .find(|item| item.id == media_id)
-        .map(|item| item.settings.clone())
-        .ok_or_else(|| error("wallpaper_not_found", "壁纸不在媒体库中", true))?;
-    core.update_wallpaper_settings(&media_id, settings)?;
-    let effective = core.effective_settings(&media_id)?;
-    let is_running = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .any(|assignment| assignment.wallpaper_id == media_id)
-        || core.snapshot().playback.active_id.as_deref() == Some(media_id.as_str());
-    if is_running {
-        let mut player = state.player()?;
-        let assignments = core
-            .snapshot()
-            .playback
-            .display_assignments
-            .iter()
-            .filter(|assignment| assignment.wallpaper_id == media_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = apply_media_runtime_settings(&mut player, &media_id, &effective, &assignments);
-        if let Err(problem) = result {
-            let mut previous_effective = previous_snapshot.settings.clone();
-            previous.apply_to(&mut previous_effective);
-            let previous_assignments = previous_snapshot
-                .playback
-                .display_assignments
-                .iter()
-                .filter(|assignment| assignment.wallpaper_id == media_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let _ = apply_media_runtime_settings(
-                &mut player,
-                &media_id,
-                &previous_effective,
-                &previous_assignments,
-            );
-            let app_error = player_error(problem);
-            *core = WallCore::new(previous_snapshot);
-            return Err(app_error);
-        }
-        core.set_media_playback_settings(&media_id, effective.default_muted, effective.volume)?;
-    }
-    state.commit(&app, core)
+    state.commit_wallpaper_settings(&media_id, settings)
 }
 
 fn autostart_transition(previous: bool, requested: bool) -> Option<bool> {
@@ -833,6 +1454,43 @@ fn apply_media_runtime_settings(
     Ok(())
 }
 
+fn recover_settings_side_effects(
+    player: &mut MpvPlayerManager,
+    previous_settings: &[(String, AppSettings)],
+    previous_snapshot: &AppSnapshot,
+) {
+    for (media_id, settings) in previous_settings {
+        let assignments = previous_snapshot
+            .playback
+            .display_assignments
+            .iter()
+            .filter(|assignment| assignment.wallpaper_id == *media_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if apply_media_runtime_settings(player, media_id, settings, &assignments).is_err() {
+            player.stop_media(media_id);
+        }
+    }
+}
+
+fn recover_wallpaper_settings_side_effect(
+    player: &mut MpvPlayerManager,
+    media_id: &str,
+    previous_settings: &AppSettings,
+    previous_snapshot: &AppSnapshot,
+) {
+    let assignments = previous_snapshot
+        .playback
+        .display_assignments
+        .iter()
+        .filter(|assignment| assignment.wallpaper_id == media_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if apply_media_runtime_settings(player, media_id, previous_settings, &assignments).is_err() {
+        player.stop_media(media_id);
+    }
+}
+
 #[tauri::command]
 pub fn open_media_folder(state: State<'_, RuntimeState>, media_id: String) -> Result<(), AppError> {
     let path = state.core()?.media_path(&media_id)?;
@@ -876,48 +1534,17 @@ pub fn quit(app: AppHandle, state: State<'_, RuntimeState>) {
 
 /// 由 Windows 状态监视器设置单个自动暂停来源。
 pub fn set_automatic_pause(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     reason: PauseReason,
     paused: bool,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    if core.snapshot().playback.active_id.is_none() {
-        return Ok(core.snapshot().clone());
-    }
-    let previous_snapshot = core.snapshot().clone();
-    let before = previous_snapshot.playback.display_assignments.clone();
-    let was_paused = core.snapshot().playback.is_paused();
-    core.set_pause_reason(reason, paused);
-    let after = core.snapshot().playback.display_assignments.clone();
-    if !before.is_empty() {
-        let mut player = state.player()?;
-        let transitions =
-            online_pause_transitions(pause_transitions(&before, &after), |target_id| {
-                player.has_target(target_id)
-            });
-        let mut applied: Vec<(String, bool)> = Vec::new();
-        for (target_id, target_paused) in transitions {
-            if let Err(problem) = player.set_target_paused(&target_id, target_paused) {
-                for (applied_id, applied_paused) in applied.iter().rev() {
-                    let _ = player.set_target_paused(applied_id, !applied_paused);
-                }
-                *core = WallCore::new(previous_snapshot);
-                return Err(player_error(problem));
-            }
-            applied.push((target_id, target_paused));
+    state.commit_pause_change(|core| {
+        if core.snapshot().playback.active_id.is_some() {
+            core.set_pause_reason(reason, paused);
         }
-        drop(player);
-        return state.commit(&app, core);
-    }
-    let is_paused = core.snapshot().playback.is_paused();
-    if was_paused != is_paused
-        && let Err(problem) = state.player()?.set_paused(is_paused)
-    {
-        *core = WallCore::new(previous_snapshot);
-        return Err(player_error(problem));
-    }
-    state.commit(&app, core)
+        Ok(())
+    })
 }
 
 fn pause_transitions(
@@ -952,39 +1579,13 @@ where
 
 /// 由 Windows 状态监视器更新单个显示目标的自动暂停来源。
 pub fn set_target_automatic_pause(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, RuntimeState>,
     target_id: &str,
     reason: PauseReason,
     paused: bool,
 ) -> Result<AppSnapshot, AppError> {
-    let mut core = state.core()?;
-    let previous_snapshot = core.snapshot().clone();
-    let was_paused = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .find(|assignment| assignment.target_id == target_id)
-        .is_some_and(|assignment| assignment.status == crate::model::PlaybackStatus::Paused);
-    core.set_target_pause_reason(target_id, reason, paused)?;
-    let is_paused = core
-        .snapshot()
-        .playback
-        .display_assignments
-        .iter()
-        .find(|assignment| assignment.target_id == target_id)
-        .is_some_and(|assignment| assignment.status == crate::model::PlaybackStatus::Paused);
-    let mut player = state.player()?;
-    if was_paused != is_paused
-        && player.has_target(target_id)
-        && let Err(problem) = player.set_target_paused(target_id, is_paused)
-    {
-        *core = WallCore::new(previous_snapshot);
-        return Err(player_error(problem));
-    }
-    drop(player);
-    state.commit(&app, core)
+    state.commit_pause_change(|core| core.set_target_pause_reason(target_id, reason, paused))
 }
 
 /// 由后台监视器定期校准复制组播放位置。
@@ -1056,14 +1657,21 @@ fn error(code: &str, message: &str, recoverable: bool) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROJECT_HOMEPAGE, SnapshotPublisher, autostart_transition, discard_disabled_session,
-        online_pause_transitions, pause_transitions, persist_snapshot, prepare_commit,
+        PROJECT_HOMEPAGE, RuntimeState, SnapshotPublisher, autostart_transition,
+        build_player_restore_plan, discard_disabled_session, online_pause_transitions,
+        pause_transitions,
     };
     use crate::core::WallCore;
-    use crate::model::{AppSnapshot, DisplayAssignment, DisplayMode, PauseReason, PlaybackStatus};
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use crate::media::import_media;
+    use crate::model::{
+        AppSnapshot, DisplayAssignment, DisplayMode, PauseReason, PlaybackStatus, WallpaperSettings,
+    };
+    use crate::player::MpvPlayerManager;
+    use crate::storage::Storage;
+    use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, mpsc};
 
     #[test]
     fn unrelated_setting_changes_do_not_touch_autostart() {
@@ -1071,50 +1679,6 @@ mod tests {
         assert_eq!(autostart_transition(true, true), None);
         assert_eq!(autostart_transition(false, true), Some(true));
         assert_eq!(autostart_transition(true, false), Some(false));
-    }
-
-    #[test]
-    fn commit_waits_without_core_lock_and_uses_the_latest_snapshot() {
-        let core = Arc::new(Mutex::new(WallCore::new(AppSnapshot::default())));
-        let commit_gate = Arc::new(Mutex::new(()));
-        let held_gate = commit_gate.lock().expect("commit gate");
-        let worker_core = Arc::clone(&core);
-        let worker_gate = Arc::clone(&commit_gate);
-        let worker = thread::spawn(move || {
-            let core_guard = worker_core.lock().expect("core lock");
-            let (snapshot, _commit_guard) =
-                prepare_commit(&worker_core, core_guard, &worker_gate).expect("prepare commit");
-            snapshot
-        });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut latest = None;
-        while Instant::now() < deadline {
-            if let Ok(mut guard) = core.try_lock() {
-                guard.set_volume(42).expect("set volume");
-                latest = Some(guard.snapshot().clone());
-                break;
-            }
-            thread::yield_now();
-        }
-        let latest = latest.expect("worker must release core before waiting for commit gate");
-        drop(held_gate);
-
-        assert_eq!(worker.join().expect("worker"), latest);
-    }
-
-    #[test]
-    fn commit_gate_covers_persistence_and_publish_enqueue() {
-        let core = Mutex::new(WallCore::new(AppSnapshot::default()));
-        let commit_gate = Mutex::new(());
-        let core_guard = core.lock().expect("core lock");
-        let snapshot = persist_snapshot(&core, core_guard, &commit_gate, |_| {
-            assert!(commit_gate.try_lock().is_err());
-            Ok(())
-        })
-        .expect("persist snapshot");
-
-        assert_eq!(snapshot, AppSnapshot::default());
-        assert!(commit_gate.try_lock().is_ok());
     }
 
     #[test]
@@ -1139,8 +1703,326 @@ mod tests {
     }
 
     #[test]
+    fn library_change_keeps_core_unchanged_when_player_or_storage_is_unavailable() {
+        let root = command_test_root("library-change-rollback");
+        let (snapshot, media_id, source) = snapshot_with_media(&root);
+        let poisoned_state = runtime_state(root.join("poisoned-storage"), snapshot.clone());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _player = poisoned_state.player.lock().expect("player lock");
+            panic!("poison player lock");
+        }));
+
+        let player_error = poisoned_state
+            .commit_library_change(|core| {
+                core.remove_many(std::slice::from_ref(&media_id))?;
+                Ok(vec![media_id.clone()])
+            })
+            .expect_err("reject poisoned player");
+
+        assert_eq!(player_error.code, "player_poisoned");
+        assert_eq!(
+            poisoned_state.core().expect("core state").snapshot(),
+            &snapshot
+        );
+
+        let invalid_storage = root.join("storage-file");
+        fs::write(&invalid_storage, b"not a directory").expect("create invalid storage root");
+        let storage_state = runtime_state(invalid_storage, snapshot.clone());
+        let storage_error = storage_state
+            .commit_library_change(|core| {
+                core.remove_many(std::slice::from_ref(&media_id))?;
+                Ok(vec![media_id.clone()])
+            })
+            .expect_err("reject failed persistence");
+
+        assert_eq!(storage_error.code, "storage_failed");
+        assert_eq!(
+            storage_state.core().expect("core state").snapshot(),
+            &snapshot
+        );
+        assert!(source.is_file());
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn library_change_returns_the_committed_snapshot_when_async_publish_is_closed() {
+        let root = command_test_root("library-change-publish");
+        let (snapshot, media_id, source) = snapshot_with_media(&root);
+        let mut state = runtime_state(root.join("storage"), snapshot);
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        state.publisher = SnapshotPublisher { sender };
+
+        let committed = state
+            .commit_library_change(|core| {
+                core.remove_many(std::slice::from_ref(&media_id))?;
+                Ok(vec![media_id.clone()])
+            })
+            .expect("commit despite closed async publisher");
+
+        assert!(committed.library.is_empty());
+        assert!(
+            state
+                .core()
+                .expect("core state")
+                .snapshot()
+                .library
+                .is_empty()
+        );
+        assert!(
+            Storage::new(root.join("storage"))
+                .load()
+                .expect("load committed storage")
+                .library
+                .is_empty()
+        );
+        assert!(source.is_file());
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn core_change_is_atomic_on_storage_failure_and_tolerates_publish_failure() {
+        let root = command_test_root("core-change-atomic");
+        let invalid_storage = root.join("storage-file");
+        fs::create_dir_all(&root).expect("create command test root");
+        fs::write(&invalid_storage, b"not a directory").expect("create invalid storage root");
+        let snapshot = AppSnapshot::default();
+        let failed_state = runtime_state(invalid_storage, snapshot.clone());
+
+        let failure = failed_state
+            .commit_core_change(|core| core.create_category("自然风景"))
+            .expect_err("reject failed persistence");
+
+        assert_eq!(failure.code, "storage_failed");
+        assert_eq!(
+            failed_state.core().expect("core state").snapshot(),
+            &snapshot
+        );
+
+        let mut published_state = runtime_state(root.join("storage"), snapshot);
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        published_state.publisher = SnapshotPublisher { sender };
+        let (committed, category) = published_state
+            .commit_core_change(|core| core.create_category("城市夜景"))
+            .expect("commit despite closed publisher");
+
+        assert_eq!(category.name, "城市夜景");
+        assert_eq!(committed.categories.len(), 1);
+        assert_eq!(
+            Storage::new(root.join("storage"))
+                .load()
+                .expect("load committed snapshot")
+                .categories
+                .len(),
+            1
+        );
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn wallpaper_settings_keep_shared_state_when_persistence_fails() {
+        let root = command_test_root("wallpaper-settings-rollback");
+        let (snapshot, media_id, source) = snapshot_with_media(&root);
+        let invalid_storage = root.join("storage-file");
+        fs::write(&invalid_storage, b"not a directory").expect("create invalid storage root");
+        let state = runtime_state(invalid_storage, snapshot.clone());
+
+        let failure = state
+            .commit_wallpaper_settings(
+                &media_id,
+                WallpaperSettings {
+                    volume: Some(42),
+                    ..Default::default()
+                },
+            )
+            .expect_err("reject failed settings persistence");
+
+        assert_eq!(failure.code, "storage_failed");
+        assert_eq!(state.core().expect("core state").snapshot(), &snapshot);
+        assert!(source.is_file());
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn pause_change_keeps_shared_state_when_persistence_fails() {
+        let root = command_test_root("pause-change-rollback");
+        let (mut snapshot, media_id, source) = snapshot_with_media(&root);
+        snapshot.playback.active_id = Some(media_id.clone());
+        snapshot.playback.status = PlaybackStatus::Playing;
+        snapshot.playback.display_assignments = vec![DisplayAssignment {
+            target_id: "display:left".to_owned(),
+            mode: DisplayMode::Independent,
+            display_ids: vec!["left".to_owned()],
+            wallpaper_id: media_id,
+            status: PlaybackStatus::Playing,
+            muted: true,
+            volume: 0,
+            pause_reasons: Vec::new(),
+        }];
+        snapshot.displays = vec![crate::model::DisplayInfo {
+            id: "left".to_owned(),
+            name: "Left".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+            connected: true,
+        }];
+        let poisoned_state = runtime_state(root.join("poisoned-storage"), snapshot.clone());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _player = poisoned_state.player.lock().expect("player lock");
+            panic!("poison player lock");
+        }));
+        let player_failure = poisoned_state
+            .commit_pause_change(WallCore::toggle_pause)
+            .expect_err("reject unavailable player");
+        assert_eq!(player_failure.code, "player_poisoned");
+        assert_eq!(
+            poisoned_state.core().expect("core state").snapshot(),
+            &snapshot
+        );
+
+        let invalid_storage = root.join("storage-file");
+        fs::write(&invalid_storage, b"not a directory").expect("create invalid storage root");
+        let state = runtime_state(invalid_storage, snapshot.clone());
+
+        let failure = state
+            .commit_pause_change(|core| core.toggle_target_pause("display:left"))
+            .expect_err("reject failed pause persistence");
+
+        assert_eq!(failure.code, "storage_failed");
+        assert_eq!(state.core().expect("core state").snapshot(), &snapshot);
+        assert!(source.is_file());
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn runtime_commands_never_publish_unpersisted_shared_state() {
+        let root = command_test_root("runtime-command-atomic");
+        let (mut snapshot, media_id, source) = snapshot_with_media(&root);
+        snapshot.playback.active_id = Some(media_id.clone());
+        snapshot.playback.status = PlaybackStatus::Playing;
+        snapshot.playback.display_assignments = vec![DisplayAssignment {
+            target_id: "display:left".to_owned(),
+            mode: DisplayMode::Independent,
+            display_ids: vec!["left".to_owned()],
+            wallpaper_id: media_id.clone(),
+            status: PlaybackStatus::Playing,
+            muted: true,
+            volume: 0,
+            pause_reasons: Vec::new(),
+        }];
+        snapshot.displays = vec![crate::model::DisplayInfo {
+            id: "left".to_owned(),
+            name: "Left".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+            connected: true,
+        }];
+        let invalid_storage = root.join("storage-file");
+        fs::write(&invalid_storage, b"not a directory").expect("create invalid storage root");
+        let state = runtime_state(invalid_storage, snapshot.clone());
+
+        let failures = [
+            state.commit_muted(false),
+            state.commit_target_muted("display:left", false),
+            state.commit_volume(42),
+            state.commit_scale_mode(crate::model::ScaleMode::Contain),
+            state.commit_stop_change(
+                |core| core.stop_target("display:left"),
+                |player| player.stop_target("display:left"),
+            ),
+            state.commit_stop_change(
+                |core| {
+                    core.stop();
+                    Ok(())
+                },
+                MpvPlayerManager::stop,
+            ),
+            state.commit_display_refresh(vec![crate::model::DisplayInfo {
+                id: "left".to_owned(),
+                name: "Left Updated".to_owned(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                primary: true,
+                connected: true,
+            }]),
+        ];
+        for failure in failures {
+            assert_eq!(
+                failure.expect_err("reject failed persistence").code,
+                "storage_failed"
+            );
+            assert_eq!(state.core().expect("core state").snapshot(), &snapshot);
+        }
+
+        let play_failure = state
+            .commit_play(&media_id)
+            .expect_err("reject unavailable player binary");
+        assert_eq!(play_failure.code, "mpv_missing");
+        assert_eq!(state.core().expect("core state").snapshot(), &snapshot);
+        assert!(source.is_file());
+        fs::remove_dir_all(root).expect("clean command test directory");
+    }
+
+    #[test]
+    fn player_restore_plan_excludes_error_and_non_running_targets() {
+        let mut snapshot = AppSnapshot::default();
+        let playing = assignment("playing", Vec::new());
+        let mut failed = assignment("failed", Vec::new());
+        failed.status = PlaybackStatus::Error;
+        let missing = assignment("missing", Vec::new());
+        snapshot.playback.active_id = Some(playing.wallpaper_id.clone());
+        snapshot.playback.status = PlaybackStatus::Error;
+        snapshot.playback.display_assignments = vec![playing, failed, missing];
+
+        let plan = build_player_restore_plan(&snapshot, |target_id| target_id != "missing");
+
+        assert_eq!(plan.target_ids, vec!["playing"]);
+        assert!(!plan.legacy);
+
+        snapshot.playback.display_assignments.clear();
+        let legacy = build_player_restore_plan(&snapshot, |_| true);
+        assert!(!legacy.legacy);
+    }
+
+    #[test]
     fn project_homepage_points_to_the_public_repository() {
         assert_eq!(PROJECT_HOMEPAGE, "https://github.com/NiceBlueChai/wall");
+    }
+
+    fn runtime_state(root: PathBuf, snapshot: AppSnapshot) -> RuntimeState {
+        RuntimeState {
+            core: Mutex::new(WallCore::new(snapshot)),
+            commit_gate: Mutex::new(()),
+            player: Mutex::new(MpvPlayerManager::default()),
+            publisher: SnapshotPublisher::spawn(|_| {}).expect("start snapshot publisher"),
+            storage: Storage::new(root.clone()),
+            mpv_binary: PathBuf::from("mpv.exe"),
+            data_dir: root,
+        }
+    }
+
+    fn snapshot_with_media(root: &PathBuf) -> (AppSnapshot, String, PathBuf) {
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).expect("create command test directory");
+        let source = root.join("wallpaper.mp4");
+        fs::write(&source, b"wallpaper").expect("create source media");
+        let mut snapshot = AppSnapshot::default();
+        let imported = import_media(&mut snapshot, std::slice::from_ref(&source))
+            .expect("import source media");
+        (snapshot, imported[0].id.clone(), source)
+    }
+
+    fn command_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wall-command-{label}-{}", std::process::id()))
     }
 
     #[test]

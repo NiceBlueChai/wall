@@ -1,5 +1,5 @@
 /** 验证前端状态的默认值、筛选和原生快照同步。 */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createWallStore, defaultSettings } from './store';
 import type { AppSnapshot } from './types';
 
@@ -74,6 +74,41 @@ describe('Wall store', () => {
         store.exitBatchMode();
         expect(store.batchMode).toBe(false);
         expect(store.selectedMediaIds).toEqual([]);
+    });
+
+    it('detects active media and exposes a short-lived notice', () => {
+        vi.useFakeTimers();
+        const store = createWallStore();
+        store.applySnapshot({
+            library: [media('1', 'Ocean Loop', 'video')],
+            categories: [],
+            settings: defaultSettings(),
+            playback: {
+                ...idlePlayback(),
+                activeId: 'legacy',
+                displayAssignments: [
+                    {
+                        targetId: 'display:primary',
+                        mode: 'independent',
+                        displayIds: ['primary'],
+                        wallpaperId: '1',
+                        status: 'playing',
+                        muted: true,
+                        volume: 0,
+                        pauseReasons: [],
+                    },
+                ],
+            },
+        });
+
+        expect(store.isMediaActive('1')).toBe(true);
+        expect(store.isMediaActive('legacy')).toBe(false);
+        store.showNotice('已从壁纸库移除');
+        expect(store.notice).toBe('已从壁纸库移除');
+
+        vi.advanceTimersByTime(3000);
+        expect(store.notice).toBe('');
+        vi.useRealTimers();
     });
 });
 
