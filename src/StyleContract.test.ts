@@ -39,6 +39,21 @@ describe('Figma style contract', () => {
         expect(css).toContain(
             '.detail-settings-video { display: grid; grid-template-columns: 180px 180px 584px; gap: 20px;',
         );
+        expect(css).toContain('.main-content { min-width: 0; min-height: 0; overflow: auto;');
+        expect(css).not.toContain('.detail-card p { max-height: 64px; overflow: auto;');
+        expect(css).not.toContain('.detail-targets { display: grid; gap: 4px; max-height: 72px; overflow: auto;');
+        expect(css).not.toContain('max-height: 58px; overflow: auto; margin-top: 10px;');
+        expect(css).toContain('.detail-card-content { min-height: 0; flex: 1; overflow-y: auto;');
+        expect(css).toContain('.detail-actions { min-height: 34px; flex: none;');
+        expect(css).toContain('.path-copy { display: block; color: var(--text-muted); overflow-wrap: anywhere;');
+        expect(css).not.toContain('.path-copy { display: block; overflow: hidden;');
+    });
+
+    it('keeps the Figma Select and Menu Item dimensions', () => {
+        expect(css).toContain('.wall-select-trigger { width: 100%; height: 36px;');
+        expect(css).toContain('.wall-select.open .wall-select-trigger { padding: 0 9px 0 11px; border: 2px solid');
+        expect(css).toContain('.wall-select.open .wall-select-trigger:focus-visible { outline: 0; }');
+        expect(css).toContain('.wall-select-option { width: 100%; height: 36px;');
     });
 
     it('prevents text selection outside inputs', () => {

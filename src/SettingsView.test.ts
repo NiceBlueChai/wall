@@ -96,11 +96,15 @@ describe('SettingsView', () => {
         await flushPromises();
         expect(document.activeElement).toBe(scaleModeButtons[1].element);
         expect(mocks.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ scaleMode: 'contain' }));
-        expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('21:9');
-        expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('高质量');
-        expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('源帧率');
+        expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('原始');
+        expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('均衡');
+        expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('60 FPS');
+        expect(wrapper.findAll('.settings-panel select')).toHaveLength(0);
+        expect(wrapper.findAll('.settings-panel [role="combobox"]')).toHaveLength(3);
 
-        await wrapper.get('[data-setting="aspect-ratio"]').setValue('ratio21x9');
+        const aspectRatio = wrapper.get('[data-setting="aspect-ratio"]');
+        await aspectRatio.get('[role="combobox"]').trigger('click');
+        await aspectRatio.get('[role="option"][data-value="ratio21x9"]').trigger('click');
         await flushPromises();
         expect(mocks.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ aspectRatio: 'ratio21x9' }));
 

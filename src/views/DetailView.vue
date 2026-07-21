@@ -16,6 +16,8 @@ import {
 } from '../api';
 import { wallStore } from '../store';
 import WallIcon from '../components/WallIcon.vue';
+import WallSelect from '../components/WallSelect.vue';
+import { antiAliasingOptions, aspectRatioOptions, frameRateOptions } from '../playbackOptions';
 import type { AppSettings, WallpaperSettings } from '../types';
 
 const route = useRoute();
@@ -398,72 +400,74 @@ function playPreview() {
                     </button>
                 </div>
                 <aside class="detail-card">
-                    <h2>{{ item.name }}</h2>
-                    <span class="format-label">{{ item.kind.toUpperCase() }} · {{ item.format }}</span>
-                    <div class="wallpaper-categories">
-                        <span v-for="category in itemCategories" :key="category.id" class="category-tag">
-                            {{ category.name }}
-                        </span>
-                        <button
-                            ref="categoryTrigger"
-                            class="category-edit-button"
-                            aria-label="编辑分类"
-                            aria-haspopup="menu"
-                            :aria-expanded="categoryEditorOpen"
-                            :disabled="categoryBusy"
-                            @click="toggleCategoryEditor"
-                            @keydown.down.prevent="openCategoryEditorFromKeyboard(false)"
-                            @keydown.up.prevent="openCategoryEditorFromKeyboard(true)"
-                        >
-                            <WallIcon name="settings" :size="14" />编辑分类
-                        </button>
-                        <div
-                            v-if="categoryEditorOpen"
-                            ref="categoryMenu"
-                            class="wallpaper-category-menu"
-                            role="menu"
-                            @keydown="handleCategoryMenuKeydown"
-                        >
+                    <div class="detail-card-content">
+                        <h2 :title="item.name">{{ item.name }}</h2>
+                        <span class="format-label">{{ item.kind.toUpperCase() }} · {{ item.format }}</span>
+                        <div class="wallpaper-categories">
+                            <span v-for="category in itemCategories" :key="category.id" class="category-tag">
+                                {{ category.name }}
+                            </span>
                             <button
-                                v-for="category in wallStore.snapshot.categories"
-                                :key="category.id"
-                                :aria-label="
-                                    item.categoryIds.includes(category.id)
-                                        ? `从${category.name}移除`
-                                        : `添加到${category.name}`
-                                "
-                                role="menuitem"
+                                ref="categoryTrigger"
+                                class="category-edit-button"
+                                aria-label="编辑分类"
+                                aria-haspopup="menu"
+                                :aria-expanded="categoryEditorOpen"
                                 :disabled="categoryBusy"
-                                @click="toggleCategory(category.id)"
+                                @click="toggleCategoryEditor"
+                                @keydown.down.prevent="openCategoryEditorFromKeyboard(false)"
+                                @keydown.up.prevent="openCategoryEditorFromKeyboard(true)"
                             >
-                                <span>{{ category.name }}</span>
-                                <WallIcon v-if="item.categoryIds.includes(category.id)" name="check" :size="14" />
+                                <WallIcon name="settings" :size="14" />编辑分类
                             </button>
+                            <div
+                                v-if="categoryEditorOpen"
+                                ref="categoryMenu"
+                                class="wallpaper-category-menu"
+                                role="menu"
+                                @keydown="handleCategoryMenuKeydown"
+                            >
+                                <button
+                                    v-for="category in wallStore.snapshot.categories"
+                                    :key="category.id"
+                                    :aria-label="
+                                        item.categoryIds.includes(category.id)
+                                            ? `从${category.name}移除`
+                                            : `添加到${category.name}`
+                                    "
+                                    role="menuitem"
+                                    :disabled="categoryBusy"
+                                    @click="toggleCategory(category.id)"
+                                >
+                                    <span>{{ category.name }}</span>
+                                    <WallIcon v-if="item.categoryIds.includes(category.id)" name="check" :size="14" />
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                    <p>
-                        {{ item.width ? `${item.width} × ${item.height}` : '尺寸将在播放后读取' }}<br />{{
-                            duration(item.durationSeconds, item.kind)
-                        }}<br /><span class="path-copy">{{ item.path }}</span>
-                    </p>
-                    <div v-if="targetLabels.length" class="detail-targets">
-                        <span>当前目标</span>
-                        <strong v-for="target in targetLabels" :key="target">{{ target }}</strong>
-                    </div>
-                    <div class="playback-state">
-                        <i :class="{ error: item.missing }" />{{
-                            item.missing
-                                ? '文件丢失'
-                                : active
-                                  ? item.kind === 'image'
-                                      ? '正在显示'
-                                      : paused
-                                        ? '已暂停'
-                                        : muted
-                                          ? '正在运行 · 已静音'
-                                          : '正在运行'
-                                  : '未运行'
-                        }}
+                        <p class="detail-metadata">
+                            {{ item.width ? `${item.width} × ${item.height}` : '尺寸将在播放后读取' }}<br />{{
+                                duration(item.durationSeconds, item.kind)
+                            }}<br /><span class="path-copy" :title="item.path">{{ item.path }}</span>
+                        </p>
+                        <div v-if="targetLabels.length" class="detail-targets">
+                            <span>当前目标</span>
+                            <strong v-for="target in targetLabels" :key="target" :title="target">{{ target }}</strong>
+                        </div>
+                        <div class="playback-state">
+                            <i :class="{ error: item.missing }" />{{
+                                item.missing
+                                    ? '文件丢失'
+                                    : active
+                                      ? item.kind === 'image'
+                                          ? '正在显示'
+                                          : paused
+                                            ? '已暂停'
+                                            : muted
+                                              ? '正在运行 · 已静音'
+                                              : '正在运行'
+                                      : '未运行'
+                            }}
+                        </div>
                     </div>
                     <div class="detail-actions">
                         <button v-if="item.missing" class="primary" :disabled="actionBusy" @click="relocate">
@@ -526,64 +530,36 @@ function playPreview() {
                     </div>
                     <div class="detail-setting-field">
                         <label>画幅</label>
-                        <select
+                        <WallSelect
                             data-setting="aspect-ratio"
                             :disabled="settingsBusy"
-                            :value="effectiveSettings.aspectRatio"
-                            @change="
-                                changeOverride(
-                                    'aspectRatio',
-                                    ($event.target as HTMLSelectElement).value as AppSettings['aspectRatio'],
-                                )
-                            "
-                        >
-                            <option value="original">原始</option>
-                            <option value="screen">屏幕</option>
-                            <option value="ratio16x9">16:9</option>
-                            <option value="ratio16x10">16:10</option>
-                            <option value="ratio21x9">21:9</option>
-                            <option value="ratio32x9">32:9</option>
-                            <option value="ratio4x3">4:3</option>
-                            <option value="ratio1x1">1:1</option>
-                            <option value="ratio9x16">9:16</option>
-                        </select>
+                            :model-value="effectiveSettings.aspectRatio"
+                            :options="aspectRatioOptions"
+                            label="画幅"
+                            @change="changeOverride('aspectRatio', $event as AppSettings['aspectRatio'])"
+                        />
                     </div>
                     <div class="detail-setting-field">
                         <label>抗锯齿</label>
-                        <select
+                        <WallSelect
                             data-setting="anti-aliasing"
                             :disabled="settingsBusy"
-                            :value="effectiveSettings.antiAliasing"
-                            @change="
-                                changeOverride(
-                                    'antiAliasing',
-                                    ($event.target as HTMLSelectElement).value as AppSettings['antiAliasing'],
-                                )
-                            "
-                        >
-                            <option value="off">关闭</option>
-                            <option value="balanced">均衡</option>
-                            <option value="high">高质量</option>
-                        </select>
+                            :model-value="effectiveSettings.antiAliasing"
+                            :options="antiAliasingOptions"
+                            label="抗锯齿"
+                            @change="changeOverride('antiAliasing', $event as AppSettings['antiAliasing'])"
+                        />
                     </div>
                     <div v-if="item.kind === 'video'" class="detail-setting-field">
                         <label>帧率</label>
-                        <select
+                        <WallSelect
                             data-setting="frame-rate"
                             :disabled="settingsBusy"
-                            :value="effectiveSettings.frameRate"
-                            @change="
-                                changeOverride(
-                                    'frameRate',
-                                    Number(($event.target as HTMLSelectElement).value) as AppSettings['frameRate'],
-                                )
-                            "
-                        >
-                            <option :value="0">源帧率</option>
-                            <option :value="24">24 FPS</option>
-                            <option :value="30">30 FPS</option>
-                            <option :value="60">60 FPS</option>
-                        </select>
+                            :model-value="effectiveSettings.frameRate"
+                            :options="frameRateOptions"
+                            label="帧率"
+                            @change="changeOverride('frameRate', $event as AppSettings['frameRate'])"
+                        />
                     </div>
                 </div>
                 <div v-if="item.kind === 'video'" class="detail-settings-video">

@@ -115,6 +115,11 @@ describe('DetailView', () => {
         expect(wrapper.text()).not.toContain('静态图片');
         expect(wrapper.text()).toContain('播放覆盖设置');
         expect(wrapper.text()).not.toContain('图片壁纸不显示帧率、硬件解码和声音设置');
+        expect(wrapper.findAll('.detail-settings select')).toHaveLength(0);
+        expect(wrapper.findAll('.detail-settings [role="combobox"]')).toHaveLength(3);
+        expect(wrapper.get('.detail-card h2').attributes('title')).toBe('Video');
+        expect(wrapper.get('.path-copy').attributes('title')).toBe('D:\\Wallpapers\\video.mp4');
+        expect(wrapper.get('.detail-targets strong').attributes('title')).toBe('独立 · 显示器 1');
         const previewVideo = wrapper.get<HTMLVideoElement>('.media-preview video');
         const previewPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
         expect(previewVideo.attributes('controls')).toBeDefined();
@@ -169,10 +174,12 @@ describe('DetailView', () => {
         await flushPromises();
         expect(apiMocks.setCategoryMembershipMock).toHaveBeenCalledWith(['video-1'], 'city', true);
         expect(wrapper.text()).toContain('使用全局设置');
-        expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('21:9');
-        expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('高质量');
-        expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('源帧率');
-        await wrapper.get('[data-setting="aspect-ratio"]').setValue('ratio21x9');
+        expect(wrapper.get('[data-setting="aspect-ratio"]').text()).toContain('原始');
+        expect(wrapper.get('[data-setting="anti-aliasing"]').text()).toContain('均衡');
+        expect(wrapper.get('[data-setting="frame-rate"]').text()).toContain('60 FPS');
+        const aspectRatio = wrapper.get('[data-setting="aspect-ratio"]');
+        await aspectRatio.get('[role="combobox"]').trigger('click');
+        await aspectRatio.get('[role="option"][data-value="ratio21x9"]').trigger('click');
         await flushPromises();
         expect(apiMocks.setWallpaperSettingsMock).toHaveBeenCalledWith('video-1', {
             aspectRatio: 'ratio21x9',
@@ -225,6 +232,8 @@ describe('DetailView', () => {
         expect(wrapper.find('[data-setting="aspect-ratio"]').exists()).toBe(true);
         expect(wrapper.find('[data-setting="anti-aliasing"]').exists()).toBe(true);
         expect(wrapper.find('[data-setting="frame-rate"]').exists()).toBe(false);
+        expect(wrapper.findAll('.detail-settings select')).toHaveLength(0);
+        expect(wrapper.findAll('.detail-settings [role="combobox"]')).toHaveLength(2);
         expect(wrapper.find('.mute-button').exists()).toBe(false);
         expect(wrapper.find('.volume-field').exists()).toBe(false);
         expect(wrapper.text()).toContain('播放覆盖设置');

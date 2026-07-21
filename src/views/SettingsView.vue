@@ -5,6 +5,8 @@ import { RouterLink, useRoute } from 'vue-router';
 import { openLicense, openProjectHomepage, updateSettings } from '../api';
 import { wallStore } from '../store';
 import WallIcon from '../components/WallIcon.vue';
+import WallSelect from '../components/WallSelect.vue';
+import { antiAliasingOptions, aspectRatioOptions, frameRateOptions, languageOptions } from '../playbackOptions';
 import type { AppSettings } from '../types';
 
 const route = useRoute();
@@ -128,9 +130,7 @@ function readError(error: unknown): string {
             </div>
             <div class="setting-row">
                 <div><strong>界面语言</strong><small>v1 仅提供简体中文</small></div>
-                <select disabled>
-                    <option>简体中文</option>
-                </select>
+                <WallSelect disabled model-value="zh-CN" :options="languageOptions" label="界面语言" />
             </div>
         </div>
 
@@ -156,61 +156,36 @@ function readError(error: unknown): string {
             </div>
             <div class="setting-row">
                 <div><strong>画幅</strong><small>覆盖视频的逻辑宽高比</small></div>
-                <select
+                <WallSelect
                     data-setting="aspect-ratio"
                     :disabled="settingsBusy"
-                    :value="settings.aspectRatio"
-                    @change="
-                        change('aspectRatio', ($event.target as HTMLSelectElement).value as AppSettings['aspectRatio'])
-                    "
-                >
-                    <option value="original">原始</option>
-                    <option value="screen">屏幕</option>
-                    <option value="ratio16x9">16:9</option>
-                    <option value="ratio16x10">16:10</option>
-                    <option value="ratio21x9">21:9</option>
-                    <option value="ratio32x9">32:9</option>
-                    <option value="ratio4x3">4:3</option>
-                    <option value="ratio1x1">1:1</option>
-                    <option value="ratio9x16">9:16</option>
-                </select>
+                    :model-value="settings.aspectRatio"
+                    :options="aspectRatioOptions"
+                    label="画幅"
+                    @change="change('aspectRatio', $event as AppSettings['aspectRatio'])"
+                />
             </div>
             <div class="setting-row">
                 <div><strong>抗锯齿</strong><small>更高质量会增加 GPU 占用</small></div>
-                <select
+                <WallSelect
                     data-setting="anti-aliasing"
                     :disabled="settingsBusy"
-                    :value="settings.antiAliasing"
-                    @change="
-                        change(
-                            'antiAliasing',
-                            ($event.target as HTMLSelectElement).value as AppSettings['antiAliasing'],
-                        )
-                    "
-                >
-                    <option value="off">关闭</option>
-                    <option value="balanced">均衡</option>
-                    <option value="high">高质量</option>
-                </select>
+                    :model-value="settings.antiAliasing"
+                    :options="antiAliasingOptions"
+                    label="抗锯齿"
+                    @change="change('antiAliasing', $event as AppSettings['antiAliasing'])"
+                />
             </div>
             <div class="setting-row">
                 <div><strong>帧率上限</strong><small>降低数值可以减少 GPU 占用</small></div>
-                <select
+                <WallSelect
                     data-setting="frame-rate"
                     :disabled="settingsBusy"
-                    :value="settings.frameRate"
-                    @change="
-                        change(
-                            'frameRate',
-                            Number(($event.target as HTMLSelectElement).value) as AppSettings['frameRate'],
-                        )
-                    "
-                >
-                    <option :value="0">源帧率</option>
-                    <option :value="24">24 FPS</option>
-                    <option :value="30">30 FPS</option>
-                    <option :value="60">60 FPS</option>
-                </select>
+                    :model-value="settings.frameRate"
+                    :options="frameRateOptions"
+                    label="帧率上限"
+                    @change="change('frameRate', $event as AppSettings['frameRate'])"
+                />
             </div>
             <div class="setting-row">
                 <div><strong>硬件解码</strong><small>优先使用 GPU 解码视频</small></div>
