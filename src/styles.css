@@ -417,6 +417,7 @@ html:has(.modal-scrim) .main-content {
     border: 1px solid var(--border-default);
     border-radius: 10px;
     background: var(--surface-panel);
+    box-shadow: 0 16px 36px #0008;
 }
 .batch-category-menu button {
     width: 100%;
@@ -992,19 +993,31 @@ button:disabled {
 .detail-page .page-heading {
     margin-bottom: 18px;
 }
+.detail-page .page-heading > h1 {
+    min-width: 0;
+    flex: 1;
+    margin-right: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .detail-heading-actions {
+    flex: none;
     display: flex;
     align-items: center;
     gap: 10px;
 }
 .detail-heading-actions button {
+    flex: none;
     display: flex;
     align-items: center;
     gap: 6px;
+    white-space: nowrap;
 }
 .back-button {
     width: 32px;
     height: 32px;
+    flex: none;
     display: grid;
     place-items: center;
     padding: 0;
@@ -1063,7 +1076,7 @@ button:disabled {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 22px;
+    padding: 20px;
     border-radius: 14px;
     background: var(--surface-panel);
 }
@@ -1071,6 +1084,7 @@ button:disabled {
     min-height: 0;
     flex: 1;
     overflow-y: auto;
+    overflow-x: hidden;
     padding-right: 8px;
     scrollbar-color: var(--border-strong) transparent;
     scrollbar-gutter: stable;
@@ -1088,24 +1102,32 @@ button:disabled {
 }
 .detail-card h2 {
     margin: 0 0 4px;
-    font-size: 20px;
-    line-height: 28px;
+    font-size: 18px;
+    line-height: 24px;
     overflow-wrap: anywhere;
 }
 .format-label {
+    display: block;
     color: #9e8cff;
     font-size: 11px;
-}
-.detail-metadata {
-    margin: 8px 0 0;
-    color: var(--text-secondary);
-    font-size: 12px;
-    line-height: 19px;
+    line-height: 16px;
 }
 .path-copy {
     display: block;
     color: var(--text-muted);
     overflow-wrap: anywhere;
+}
+.detail-path {
+    margin: 8px 0 0;
+    font-size: 12px;
+    line-height: 18px;
+}
+.detail-section-label {
+    display: block;
+    margin-top: 14px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
 }
 .playback-state {
     min-height: 18px;
@@ -1171,39 +1193,53 @@ button:disabled {
     margin-top: 8px;
 }
 .category-tag {
-    padding: 4px 8px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px 0 12px;
     border: 1px solid var(--border-default);
     border-radius: 999px;
     color: var(--text-secondary);
     background: var(--surface-elevated);
-    font-size: 11px;
+    font-size: 13px;
+    font-weight: 500;
+}
+.category-tag:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+}
+.category-empty-label {
+    color: var(--text-muted);
+    font-size: 12px;
 }
 .category-edit-button {
-    height: 26px;
+    height: 28px;
     display: flex;
     align-items: center;
-    gap: 5px;
     padding: 0 8px;
     border: 0;
     border-radius: 6px;
-    color: var(--text-secondary);
+    color: var(--accent-hover);
     background: transparent;
-    font-size: 11px;
+    font-size: 12px;
+    font-weight: 500;
 }
-.category-edit-button:hover {
+.category-edit-button:hover:not(:disabled) {
     color: var(--text-primary);
     background: var(--surface-hover);
 }
 .wallpaper-category-menu {
     position: absolute;
-    top: 32px;
-    left: 0;
+    top: 34px;
+    right: 0;
     width: 208px;
     padding: 8px;
     z-index: 10;
     border: 1px solid var(--border-default);
     border-radius: 10px;
     background: var(--surface-panel);
+    box-shadow: 0 16px 36px #0008;
 }
 .wallpaper-category-menu button {
     width: 100%;
@@ -1211,16 +1247,27 @@ button:disabled {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 10px;
+    padding: 0 12px;
     border: 0;
     border-radius: 6px;
     color: var(--text-secondary);
     background: transparent;
-    font-size: 12px;
+    font-size: 13px;
 }
-.wallpaper-category-menu button:hover {
+.wallpaper-category-menu button:hover:not(:disabled) {
     color: var(--text-primary);
     background: var(--surface-hover);
+}
+.wallpaper-category-menu button:disabled {
+    color: var(--text-muted);
+    opacity: 0.65;
+}
+.category-menu-create {
+    color: var(--text-primary) !important;
+}
+.menu-check {
+    font-size: 11px;
+    font-weight: 500;
 }
 .detail-settings-header {
     height: 32px;
@@ -1302,11 +1349,6 @@ button:disabled {
 }
 .volume-field input {
     width: 100%;
-}
-.image-settings-note {
-    margin: 30px 0 0;
-    color: var(--text-muted);
-    font-size: 12px;
 }
 .segmented {
     width: 360px;

@@ -47,6 +47,11 @@ describe('Figma style contract', () => {
         expect(css).toContain('.detail-actions { min-height: 34px; flex: none;');
         expect(css).toContain('.path-copy { display: block; color: var(--text-muted); overflow-wrap: anywhere;');
         expect(css).not.toContain('.path-copy { display: block; overflow: hidden;');
+        expect(css).toContain(
+            '.detail-page .page-heading > h1 { min-width: 0; flex: 1; margin-right: 0; overflow: hidden;',
+        );
+        expect(css).toContain('.detail-heading-actions { flex: none; display: flex;');
+        expect(css).toContain('.detail-heading-actions button { flex: none; display: flex;');
     });
 
     it('keeps the Figma Select and Menu Item dimensions', () => {

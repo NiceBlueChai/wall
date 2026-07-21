@@ -1,9 +1,10 @@
-/** 验证详情页不会把尚未探测时长的视频误标为静态图片。 */
+/** 验证详情页的媒体信息、分类编辑、预览和播放操作。 */
 // @vitest-environment jsdom
 
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { openCategoryCreatorKey } from './categoryCreator';
 import { defaultSettings, wallStore } from './store';
 import DetailView from './views/DetailView.vue';
 
@@ -20,6 +21,7 @@ const apiMocks = vi.hoisted(() => ({
     toggleMediaPauseMock: vi.fn(),
     toggleTargetPauseMock: vi.fn(),
 }));
+const openCategoryCreatorMock = vi.fn();
 
 vi.mock('./api', () => ({
     mediaUrl: vi.fn(() => 'asset://video'),
@@ -42,18 +44,20 @@ enableAutoUnmount(afterEach);
 describe('DetailView', () => {
     beforeEach(() => {
         Object.values(apiMocks).forEach((mock) => mock.mockReset());
+        openCategoryCreatorMock.mockReset();
     });
 
     afterEach(() => {
         vi.restoreAllMocks();
     });
 
-    it('labels unknown video duration as pending', async () => {
+    it('reads video dimensions and duration from preview metadata without requiring playback', async () => {
+        const longName = '宇宙太空神级视觉震撼-Black Hole 4K Live -src_hd_爱给网_aigei_com';
         wallStore.applySnapshot({
             library: [
                 {
                     id: 'video-1',
-                    name: 'Video',
+                    name: longName,
                     path: 'D:\\Wallpapers\\video.mp4',
                     kind: 'video',
                     format: 'MP4',
@@ -111,13 +115,17 @@ describe('DetailView', () => {
         await router.isReady();
         const wrapper = mount(DetailView, { attachTo: document.body, global: { plugins: [router] } });
 
-        expect(wrapper.text()).toContain('时长将在播放后读取');
+        expect(wrapper.get('.format-label').text()).toBe('VIDEO · MP4');
+        expect(wrapper.text()).not.toContain('播放后读取');
         expect(wrapper.text()).not.toContain('静态图片');
         expect(wrapper.text()).toContain('播放覆盖设置');
         expect(wrapper.text()).not.toContain('图片壁纸不显示帧率、硬件解码和声音设置');
         expect(wrapper.findAll('.detail-settings select')).toHaveLength(0);
         expect(wrapper.findAll('.detail-settings [role="combobox"]')).toHaveLength(3);
-        expect(wrapper.get('.detail-card h2').attributes('title')).toBe('Video');
+        const heading = wrapper.get('.page-heading h1');
+        expect(heading.text()).toBe(longName);
+        expect(heading.attributes('title')).toBe(longName);
+        expect(wrapper.get('.detail-card h2').attributes('title')).toBe(longName);
         expect(wrapper.get('.path-copy').attributes('title')).toBe('D:\\Wallpapers\\video.mp4');
         expect(wrapper.get('.detail-targets strong').attributes('title')).toBe('独立 · 显示器 1');
         const previewVideo = wrapper.get<HTMLVideoElement>('.media-preview video');
@@ -126,6 +134,13 @@ describe('DetailView', () => {
         expect(previewVideo.attributes('autoplay')).toBeUndefined();
         expect(previewVideo.attributes('preload')).toBe('metadata');
         expect(previewVideo.element.muted).toBe(true);
+        Object.defineProperties(previewVideo.element, {
+            videoWidth: { configurable: true, value: 2560 },
+            videoHeight: { configurable: true, value: 1440 },
+            duration: { configurable: true, value: 95 },
+        });
+        await previewVideo.trigger('loadedmetadata');
+        expect(wrapper.get('.format-label').text()).toBe('VIDEO · MP4 · 2560 × 1440 · 01:35');
         await wrapper.get('[data-preview-action="play"]').trigger('click');
         expect(previewPlay).toHaveBeenCalledOnce();
         await previewVideo.trigger('play');
@@ -169,7 +184,7 @@ describe('DetailView', () => {
         expect(wrapper.text()).toContain('自然风景');
         expect(wrapper.text()).toContain('当前目标');
         expect(wrapper.text()).toContain('独立 · 显示器 1');
-        await wrapper.get('[aria-label="编辑分类"]').trigger('click');
+        await wrapper.get('[aria-label="添加分类"]').trigger('click');
         await wrapper.get('[aria-label="添加到城市夜景"]').trigger('click');
         await flushPromises();
         expect(apiMocks.setCategoryMembershipMock).toHaveBeenCalledWith(['video-1'], 'city', true);
@@ -199,11 +214,11 @@ describe('DetailView', () => {
                 {
                     id: 'image-1',
                     name: 'Aurora',
-                    path: 'D:\\Wallpapers\\aurora.png',
+                    path: '\\\\?\\D:\\Wallpapers\\aurora.png',
                     kind: 'image',
                     format: 'PNG',
-                    width: 1920,
-                    height: 1080,
+                    width: null,
+                    height: null,
                     durationSeconds: null,
                     thumbnailPath: null,
                     missing: false,
@@ -237,7 +252,17 @@ describe('DetailView', () => {
         expect(wrapper.find('.mute-button').exists()).toBe(false);
         expect(wrapper.find('.volume-field').exists()).toBe(false);
         expect(wrapper.text()).toContain('播放覆盖设置');
-        expect(wrapper.text()).toContain('图片壁纸不显示帧率、硬件解码和声音设置');
+        expect(wrapper.text()).not.toContain('图片壁纸不显示帧率、硬件解码和声音设置');
+        const previewImage = wrapper.get<HTMLImageElement>('.media-preview img');
+        Object.defineProperties(previewImage.element, {
+            naturalWidth: { configurable: true, value: 3840 },
+            naturalHeight: { configurable: true, value: 2160 },
+        });
+        await previewImage.trigger('load');
+        expect(wrapper.get('.format-label').text()).toBe('IMAGE · PNG · 3840 × 2160');
+        expect(wrapper.text()).not.toContain('静态图片');
+        expect(wrapper.get('.path-copy').text()).toBe('D:\\Wallpapers\\aurora.png');
+        expect(wrapper.get('.path-copy').attributes('title')).toBe('D:\\Wallpapers\\aurora.png');
         expect(wrapper.findAll('.detail-actions button').map((button) => button.text())).not.toContain('暂停');
         expect(wrapper.findAll('.detail-actions button').map((button) => button.text())).not.toContain('继续');
         expect(wrapper.findAll('.detail-actions button').map((button) => button.text())).toEqual([
@@ -316,20 +341,58 @@ describe('DetailView', () => {
             ],
         });
         const wrapper = await mountDetail();
-        const trigger = wrapper.get('[aria-label="编辑分类"]');
+        const trigger = wrapper.get('[aria-label="添加分类"]');
 
         await trigger.trigger('keydown', { key: 'ArrowDown' });
         await wrapper.vm.$nextTick();
         const items = wrapper.findAll('.wallpaper-category-menu [role="menuitem"]');
-        expect(items).toHaveLength(2);
+        expect(items).toHaveLength(3);
         expect(document.activeElement).toBe(items[0].element);
 
         await items[0].trigger('keydown', { key: 'End' });
-        expect(document.activeElement).toBe(items[1].element);
+        expect(document.activeElement).toBe(items[2].element);
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         await wrapper.vm.$nextTick();
         expect(wrapper.find('.wallpaper-category-menu').exists()).toBe(false);
         expect(document.activeElement).toBe(trigger.element);
+    });
+
+    it('offers creation from the detail menu when no categories exist', async () => {
+        applyVideoSnapshot();
+        const wrapper = await mountDetail();
+        const trigger = wrapper.get('[aria-label="添加分类"]');
+
+        expect(wrapper.get('.category-empty-label').text()).toBe('暂无分类');
+        await trigger.trigger('click');
+        expect(wrapper.get('.category-menu-empty').text()).toBe('还没有分类');
+        expect(wrapper.get('[data-category-action="create"]').text()).toBe('新建并添加');
+
+        await wrapper.get('[data-category-action="create"]').trigger('click');
+
+        expect(openCategoryCreatorMock).toHaveBeenCalledWith(['video-1'], trigger.element);
+        expect(wrapper.find('.wallpaper-category-menu').exists()).toBe(false);
+    });
+
+    it('removes assigned category tags directly and disables them in the add menu', async () => {
+        applyVideoSnapshot();
+        wallStore.applySnapshot({
+            ...wallStore.snapshot,
+            library: [{ ...wallStore.snapshot.library[0], categoryIds: ['nature'] }],
+            categories: [
+                { id: 'nature', name: '自然风景' },
+                { id: 'city', name: '城市夜景' },
+            ],
+        });
+        const wrapper = await mountDetail();
+
+        await wrapper.get('[aria-label="添加分类"]').trigger('click');
+        const assigned = wrapper.get('[aria-label="已添加自然风景"]');
+        expect(assigned.attributes()).toHaveProperty('disabled');
+        expect(assigned.text()).toContain('✓');
+        await wrapper.get('[aria-label="从自然风景移除"]').trigger('click');
+        await flushPromises();
+
+        expect(apiMocks.setCategoryMembershipMock).toHaveBeenCalledWith(['video-1'], 'nature', false);
     });
 
     it('traps single-removal dialog focus and returns to its trigger after Escape', async () => {
@@ -497,5 +560,11 @@ async function mountDetail() {
     });
     await router.push('/wallpaper/video-1');
     await router.isReady();
-    return mount(DetailView, { attachTo: document.body, global: { plugins: [router] } });
+    return mount(DetailView, {
+        attachTo: document.body,
+        global: {
+            plugins: [router],
+            provide: { [openCategoryCreatorKey as symbol]: openCategoryCreatorMock },
+        },
+    });
 }

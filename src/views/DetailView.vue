@@ -1,6 +1,6 @@
-<!-- 展示单个壁纸的本地预览、播放控制和文件恢复操作。 -->
+<!-- 展示单个壁纸的本地预览、媒体信息、分类编辑和播放操作。 -->
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, inject, nextTick, onMounted, onUnmounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -15,6 +15,7 @@ import {
     toggleMediaPause,
 } from '../api';
 import { wallStore } from '../store';
+import { openCategoryCreatorKey } from '../categoryCreator';
 import WallIcon from '../components/WallIcon.vue';
 import WallSelect from '../components/WallSelect.vue';
 import { antiAliasingOptions, aspectRatioOptions, frameRateOptions } from '../playbackOptions';
@@ -31,8 +32,15 @@ const settingsBusy = ref(false);
 const categoryBusy = ref(false);
 const previewVideo = ref<HTMLVideoElement | null>(null);
 const previewPlaying = ref(false);
+const previewMetadata = ref<{
+    mediaId: string;
+    width: number;
+    height: number;
+    durationSeconds: number | null;
+} | null>(null);
 const categoryTrigger = ref<HTMLButtonElement | null>(null);
 const categoryMenu = ref<HTMLElement | null>(null);
+const openCategoryCreator = inject(openCategoryCreatorKey, () => undefined);
 const removeTrigger = ref<HTMLButtonElement | null>(null);
 const removeCancel = ref<HTMLButtonElement | null>(null);
 const removalDialog = ref<HTMLElement | null>(null);
@@ -88,6 +96,19 @@ const effectiveSettings = computed(() => {
 const itemCategories = computed(() =>
     wallStore.snapshot.categories.filter((category) => item.value?.categoryIds.includes(category.id)),
 );
+const detailFacts = computed(() => {
+    if (!item.value) return '';
+    const detected = previewMetadata.value?.mediaId === item.value.id ? previewMetadata.value : null;
+    const width = item.value.width ?? detected?.width;
+    const height = item.value.height ?? detected?.height;
+    const facts = [item.value.kind.toUpperCase(), item.value.format];
+    if (width && height) facts.push(`${width} × ${height}`);
+    if (item.value.kind === 'video') {
+        const seconds = item.value.durationSeconds ?? detected?.durationSeconds;
+        if (seconds !== null && seconds !== undefined) facts.push(formatDuration(seconds));
+    }
+    return facts.join(' · ');
+});
 
 onMounted(() => {
     document.addEventListener('keydown', handleDocumentKeydown);
@@ -120,8 +141,7 @@ async function relocate() {
     });
 }
 
-function duration(seconds: number | null, kind: 'video' | 'image'): string {
-    if (seconds === null) return kind === 'video' ? '时长将在播放后读取' : '静态图片';
+function formatDuration(seconds: number): string {
     return `${Math.floor(seconds / 60)
         .toString()
         .padStart(2, '0')}:${Math.floor(seconds % 60)
@@ -129,9 +149,41 @@ function duration(seconds: number | null, kind: 'video' | 'image'): string {
         .padStart(2, '0')}`;
 }
 
+function displayPath(path: string): string {
+    const extendedUncPrefix = '\\\\?\\UNC\\';
+    const extendedPrefix = '\\\\?\\';
+    if (path.toUpperCase().startsWith(extendedUncPrefix)) {
+        return `\\\\${path.slice(extendedUncPrefix.length)}`;
+    }
+    return path.startsWith(extendedPrefix) ? path.slice(extendedPrefix.length) : path;
+}
+
 function readError(error: unknown): string {
     if (typeof error === 'object' && error && 'message' in error) return String(error.message);
     return String(error);
+}
+
+function captureImageMetadata(event: Event) {
+    const image = event.currentTarget;
+    if (!(image instanceof HTMLImageElement) || !item.value || !image.naturalWidth || !image.naturalHeight) return;
+    previewMetadata.value = {
+        mediaId: item.value.id,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        durationSeconds: null,
+    };
+}
+
+function captureVideoMetadata(event: Event) {
+    previewPlaying.value = false;
+    const video = event.currentTarget;
+    if (!(video instanceof HTMLVideoElement) || !item.value || !video.videoWidth || !video.videoHeight) return;
+    previewMetadata.value = {
+        mediaId: item.value.id,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        durationSeconds: Number.isFinite(video.duration) ? video.duration : null,
+    };
 }
 
 async function changeOverride<K extends keyof WallpaperSettings>(key: K, value: WallpaperSettings[K]) {
@@ -174,20 +226,25 @@ function moveScaleMode(event: KeyboardEvent, direction: -1 | 1) {
     next.focus();
 }
 
-async function toggleCategory(categoryId: string) {
+async function changeCategory(categoryId: string, assigned: boolean, closeMenu: boolean) {
     if (!item.value || categoryBusy.value) return;
-    const assigned = !item.value.categoryIds.includes(categoryId);
     categoryBusy.value = true;
     errorMessage.value = '';
     try {
         await setCategoryMembership([item.value.id], categoryId, assigned);
-        categoryEditorOpen.value = false;
+        if (closeMenu) categoryEditorOpen.value = false;
         nextTick(() => categoryTrigger.value?.focus());
     } catch (error) {
         errorMessage.value = readError(error);
     } finally {
         categoryBusy.value = false;
     }
+}
+
+function createAndAssignCategory() {
+    if (!item.value || categoryBusy.value || !categoryTrigger.value) return;
+    categoryEditorOpen.value = false;
+    openCategoryCreator([item.value.id], categoryTrigger.value);
 }
 
 async function toggleCurrentTargets() {
@@ -344,7 +401,7 @@ function playPreview() {
                 >
                     <WallIcon name="back" :size="20" />
                 </button>
-                <h1>{{ item.name }}</h1>
+                <h1 :title="item.name">{{ item.name }}</h1>
                 <div class="detail-heading-actions">
                     <button
                         ref="removeTrigger"
@@ -372,6 +429,7 @@ function playPreview() {
                         v-if="item.kind === 'image' && mediaUrl(item.path)"
                         :src="mediaUrl(item.path)"
                         :alt="item.name"
+                        @load="captureImageMetadata"
                     />
                     <video
                         v-else-if="item.kind === 'video' && mediaUrl(item.path)"
@@ -386,7 +444,7 @@ function playPreview() {
                         @play="previewPlaying = true"
                         @pause="previewPlaying = false"
                         @ended="previewPlaying = false"
-                        @loadedmetadata="previewPlaying = false"
+                        @loadedmetadata="captureVideoMetadata"
                     />
                     <div v-else class="preview-fallback">{{ item.kind === 'video' ? 'VIDEO' : 'IMAGE' }}</div>
                     <button
@@ -402,15 +460,28 @@ function playPreview() {
                 <aside class="detail-card">
                     <div class="detail-card-content">
                         <h2 :title="item.name">{{ item.name }}</h2>
-                        <span class="format-label">{{ item.kind.toUpperCase() }} · {{ item.format }}</span>
+                        <span class="format-label">{{ detailFacts }}</span>
+                        <p class="detail-path path-copy" :title="displayPath(item.path)">
+                            {{ displayPath(item.path) }}
+                        </p>
+                        <span class="detail-section-label">分类</span>
                         <div class="wallpaper-categories">
-                            <span v-for="category in itemCategories" :key="category.id" class="category-tag">
-                                {{ category.name }}
-                            </span>
+                            <button
+                                v-for="category in itemCategories"
+                                :key="category.id"
+                                class="category-tag"
+                                :aria-label="`从${category.name}移除`"
+                                :disabled="categoryBusy"
+                                @click="changeCategory(category.id, false, false)"
+                            >
+                                <span>{{ category.name }}</span
+                                ><WallIcon name="close" :size="12" />
+                            </button>
+                            <span v-if="!itemCategories.length" class="category-empty-label">暂无分类</span>
                             <button
                                 ref="categoryTrigger"
                                 class="category-edit-button"
-                                aria-label="编辑分类"
+                                aria-label="添加分类"
                                 aria-haspopup="menu"
                                 :aria-expanded="categoryEditorOpen"
                                 :disabled="categoryBusy"
@@ -418,7 +489,7 @@ function playPreview() {
                                 @keydown.down.prevent="openCategoryEditorFromKeyboard(false)"
                                 @keydown.up.prevent="openCategoryEditorFromKeyboard(true)"
                             >
-                                <WallIcon name="settings" :size="14" />编辑分类
+                                + 添加分类
                             </button>
                             <div
                                 v-if="categoryEditorOpen"
@@ -432,23 +503,34 @@ function playPreview() {
                                     :key="category.id"
                                     :aria-label="
                                         item.categoryIds.includes(category.id)
-                                            ? `从${category.name}移除`
+                                            ? `已添加${category.name}`
                                             : `添加到${category.name}`
                                     "
                                     role="menuitem"
-                                    :disabled="categoryBusy"
-                                    @click="toggleCategory(category.id)"
+                                    :disabled="categoryBusy || item.categoryIds.includes(category.id)"
+                                    @click="changeCategory(category.id, true, true)"
                                 >
                                     <span>{{ category.name }}</span>
-                                    <WallIcon v-if="item.categoryIds.includes(category.id)" name="check" :size="14" />
+                                    <span v-if="item.categoryIds.includes(category.id)" class="menu-check">✓</span>
+                                </button>
+                                <button
+                                    v-if="!wallStore.snapshot.categories.length"
+                                    class="category-menu-empty"
+                                    role="menuitem"
+                                    disabled
+                                >
+                                    还没有分类
+                                </button>
+                                <button
+                                    class="category-menu-create"
+                                    data-category-action="create"
+                                    role="menuitem"
+                                    @click="createAndAssignCategory"
+                                >
+                                    {{ wallStore.snapshot.categories.length ? '新建分类' : '新建并添加' }}
                                 </button>
                             </div>
                         </div>
-                        <p class="detail-metadata">
-                            {{ item.width ? `${item.width} × ${item.height}` : '尺寸将在播放后读取' }}<br />{{
-                                duration(item.durationSeconds, item.kind)
-                            }}<br /><span class="path-copy" :title="item.path">{{ item.path }}</span>
-                        </p>
                         <div v-if="targetLabels.length" class="detail-targets">
                             <span>当前目标</span>
                             <strong v-for="target in targetLabels" :key="target" :title="target">{{ target }}</strong>
@@ -602,7 +684,6 @@ function playPreview() {
                         />
                     </div>
                 </div>
-                <p v-else class="image-settings-note">图片壁纸不显示帧率、硬件解码和声音设置</p>
             </div>
             <p v-if="errorMessage" class="inline-error" role="alert">
                 {{ errorMessage }}

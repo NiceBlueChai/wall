@@ -1,20 +1,29 @@
 <!-- Wall 共用窗口外壳：自定义标题栏、侧栏和当前壁纸状态。 -->
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, provide, ref } from 'vue';
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { bootstrap, createCategory, deleteCategory, listenToSnapshots, renameCategory } from './api';
+import {
+    bootstrap,
+    createCategory,
+    deleteCategory,
+    listenToSnapshots,
+    renameCategory,
+    setCategoryMembership,
+} from './api';
+import { openCategoryCreatorKey } from './categoryCreator';
 import WallIcon from './components/WallIcon.vue';
 import { wallStore } from './store';
 
 const route = useRoute();
 const router = useRouter();
-const windowError = ref('');
+const appError = ref('');
 const categoryMenuOpen = ref(false);
 const categoryDialog = ref<'create' | 'rename' | 'delete' | null>(null);
 const categoryName = ref('');
 const categoryError = ref('');
 const categoryBusy = ref(false);
+const categoryAssignmentIds = ref<string[]>([]);
 const categoryMenuTrigger = ref<HTMLButtonElement | null>(null);
 const categoryMenu = ref<HTMLElement | null>(null);
 const categoryInput = ref<HTMLInputElement | null>(null);
@@ -65,10 +74,19 @@ const activeCategory = computed(() =>
     wallStore.snapshot.categories.find((item) => item.id === wallStore.activeCategoryId),
 );
 const categoryDialogTitle = computed(() => {
-    if (categoryDialog.value === 'create') return '创建分类';
+    if (categoryDialog.value === 'create') {
+        return categoryAssignmentIds.value.length ? '新建分类' : '创建分类';
+    }
     if (categoryDialog.value === 'rename') return '重命名分类';
     return '删除分类';
 });
+const categoryDialogConfirmLabel = computed(() => {
+    if (categoryDialog.value === 'delete') return '删除';
+    if (categoryDialog.value === 'create' && categoryAssignmentIds.value.length) return '创建并添加';
+    return '确认';
+});
+
+provide(openCategoryCreatorKey, (mediaIds, trigger) => openCategoryDialog('create', trigger, mediaIds));
 
 onMounted(async () => {
     document.addEventListener('keydown', handleDocumentKeydown);
@@ -89,14 +107,14 @@ function preventBrowserContextMenu(event: MouseEvent) {
 }
 
 async function windowAction(action: 'minimize' | 'maximize' | 'close') {
-    windowError.value = '';
+    appError.value = '';
     try {
         const window = getCurrentWindow();
         if (action === 'minimize') await window.minimize();
         else if (action === 'maximize') await window.toggleMaximize();
         else await window.close();
     } catch (error) {
-        windowError.value = error instanceof Error ? error.message : String(error);
+        appError.value = error instanceof Error ? error.message : String(error);
     }
 }
 
@@ -171,12 +189,19 @@ function focusMenuEdge(menu: HTMLElement | null, last: boolean) {
     items[last ? items.length - 1 : 0]?.focus();
 }
 
-function openCategoryDialog(kind: 'create' | 'rename' | 'delete', trigger?: EventTarget | null) {
+function openCategoryDialog(
+    kind: 'create' | 'rename' | 'delete',
+    trigger?: EventTarget | null,
+    mediaIds: string[] = [],
+) {
     const triggerElement = trigger instanceof HTMLElement ? trigger : categoryMenuTrigger.value;
-    categoryReturnFocus = triggerElement?.closest('.category-action-menu') ? categoryMenuTrigger.value : triggerElement;
+    const triggerInsideMenu = triggerElement?.closest('.category-action-menu');
+    categoryReturnFocus = triggerInsideMenu ? categoryMenuTrigger.value : triggerElement;
     categoryDialog.value = kind;
+    categoryAssignmentIds.value = kind === 'create' ? [...new Set(mediaIds)] : [];
     categoryName.value = kind === 'rename' ? (activeCategory.value?.name ?? '') : '';
     categoryError.value = '';
+    appError.value = '';
     categoryMenuOpen.value = false;
     nextTick(() => {
         if (kind === 'delete') categoryCancel.value?.focus();
@@ -187,6 +212,7 @@ function openCategoryDialog(kind: 'create' | 'rename' | 'delete', trigger?: Even
 function closeCategoryDialog() {
     if (categoryBusy.value) return;
     categoryDialog.value = null;
+    categoryAssignmentIds.value = [];
     nextTick(() => categoryReturnFocus?.focus());
 }
 
@@ -204,13 +230,30 @@ async function submitCategoryDialog() {
     categoryBusy.value = true;
     nextTick(() => categoryDialogElement.value?.focus());
     try {
-        if (categoryDialog.value === 'create') await createCategory(categoryName.value);
-        else if (categoryDialog.value === 'rename' && activeCategory.value) {
+        if (categoryDialog.value === 'create') {
+            const previousIds = new Set(wallStore.snapshot.categories.map((category) => category.id));
+            const assignmentIds = [...categoryAssignmentIds.value];
+            const snapshot = await createCategory(categoryName.value);
+            if (assignmentIds.length) {
+                const createdCategory = snapshot.categories.find((category) => !previousIds.has(category.id));
+                if (!createdCategory) throw new Error('无法识别新创建的分类');
+                try {
+                    await setCategoryMembership(assignmentIds, createdCategory.id, true);
+                } catch {
+                    categoryDialog.value = null;
+                    categoryAssignmentIds.value = [];
+                    appError.value = '分类已创建，但添加到当前壁纸失败，请重试';
+                    nextTick(() => categoryReturnFocus?.focus());
+                    return;
+                }
+            }
+        } else if (categoryDialog.value === 'rename' && activeCategory.value) {
             await renameCategory(activeCategory.value.id, categoryName.value);
         } else if (categoryDialog.value === 'delete' && activeCategory.value) {
             await deleteCategory(activeCategory.value.id);
         }
         categoryDialog.value = null;
+        categoryAssignmentIds.value = [];
         nextTick(() => categoryReturnFocus?.focus());
     } catch (error) {
         categoryError.value = error instanceof Error ? error.message : String(error);
@@ -379,7 +422,7 @@ function handleDocumentPointerDown(event: PointerEvent) {
         <div v-if="wallStore.notice" class="toast success-toast" role="status" aria-live="polite">
             {{ wallStore.notice }}
         </div>
-        <div v-if="windowError" class="toast error-toast">{{ windowError }}</div>
+        <div v-if="appError" class="toast error-toast" role="alert" aria-live="assertive">{{ appError }}</div>
         <div v-if="categoryDialog" class="modal-scrim">
             <div
                 ref="categoryDialogElement"
@@ -395,10 +438,15 @@ function handleDocumentPointerDown(event: PointerEvent) {
                     <p v-if="categoryDialog === 'delete'">
                         删除“{{ activeCategory?.name }}”后，壁纸文件和媒体库条目都会保留。
                     </p>
-                    <label v-else>
-                        分类名称
-                        <input ref="categoryInput" v-model="categoryName" :disabled="categoryBusy" autofocus />
-                    </label>
+                    <template v-else>
+                        <p v-if="categoryDialog === 'create' && categoryAssignmentIds.length">
+                            创建后会自动添加到{{ categoryAssignmentIds.length === 1 ? '当前壁纸' : '当前批量选择' }}。
+                        </p>
+                        <label>
+                            分类名称
+                            <input ref="categoryInput" v-model="categoryName" :disabled="categoryBusy" autofocus />
+                        </label>
+                    </template>
                     <p v-if="categoryError" class="inline-error">{{ categoryError }}</p>
                     <div class="dialog-actions">
                         <button
@@ -416,7 +464,7 @@ function handleDocumentPointerDown(event: PointerEvent) {
                             :class="categoryDialog === 'delete' ? 'danger' : 'primary'"
                             :disabled="categoryBusy"
                         >
-                            {{ categoryDialog === 'delete' ? '删除' : '确认' }}
+                            {{ categoryDialogConfirmLabel }}
                         </button>
                     </div>
                 </form>

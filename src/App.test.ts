@@ -1,18 +1,21 @@
-/** 验证自定义标题栏按钮调用原生窗口 API，并拥有对应 Tauri 权限。 */
+/** 验证应用外壳的窗口操作、分类弹窗与创建后添加编排。 */
 // @vitest-environment jsdom
 
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
+import { defineComponent, h, inject } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import capability from '../src-tauri/capabilities/default.json';
 import App from './App.vue';
+import { openCategoryCreatorKey } from './categoryCreator';
 import { defaultSettings, wallStore } from './store';
 
-const { closeMock, createCategoryMock, maximizeMock, minimizeMock } = vi.hoisted(() => ({
+const { closeMock, createCategoryMock, maximizeMock, minimizeMock, setCategoryMembershipMock } = vi.hoisted(() => ({
     closeMock: vi.fn(),
     createCategoryMock: vi.fn(),
     maximizeMock: vi.fn(),
     minimizeMock: vi.fn(),
+    setCategoryMembershipMock: vi.fn(),
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -28,6 +31,7 @@ vi.mock('./api', () => ({
     deleteCategory: vi.fn(),
     listenToSnapshots: vi.fn(async () => () => undefined),
     renameCategory: vi.fn(),
+    setCategoryMembership: setCategoryMembershipMock,
 }));
 enableAutoUnmount(afterEach);
 
@@ -37,6 +41,7 @@ describe('App window controls', () => {
         createCategoryMock.mockReset();
         maximizeMock.mockReset();
         minimizeMock.mockReset();
+        setCategoryMembershipMock.mockReset();
         wallStore.exitBatchMode();
         wallStore.activeCategoryId = null;
         wallStore.clearNotice();
@@ -115,6 +120,64 @@ describe('App window controls', () => {
         expect(wrapper.find('[data-category-action="batch"]').exists()).toBe(false);
         expect(wrapper.find('[data-category-action="rename"]').exists()).toBe(true);
         expect(wrapper.find('[data-category-action="delete"]').exists()).toBe(true);
+    });
+
+    it('creates a category from a route surface and assigns it to the requested wallpaper', async () => {
+        wallStore.applySnapshot({
+            library: [media('video-1', [])],
+            categories: [],
+            settings: defaultSettings(),
+            playback: idlePlayback(),
+        });
+        const createdSnapshot = {
+            ...wallStore.snapshot,
+            categories: [{ id: 'created', name: '动漫收藏' }],
+        };
+        createCategoryMock.mockResolvedValue(createdSnapshot);
+        setCategoryMembershipMock.mockResolvedValue(createdSnapshot);
+        const wrapper = await mountAppWithCategoryProbe();
+        const trigger = wrapper.get('[data-open-category-creator]');
+
+        await trigger.trigger('click');
+        await wrapper.vm.$nextTick();
+        expect(wrapper.get('#category-dialog-title').text()).toBe('新建分类');
+        expect(wrapper.get('.category-dialog button[type="submit"]').text()).toBe('创建并添加');
+
+        await wrapper.get('.category-dialog input').setValue('动漫收藏');
+        await wrapper.get('.category-dialog form').trigger('submit');
+        await flushPromises();
+
+        expect(createCategoryMock).toHaveBeenCalledWith('动漫收藏');
+        expect(setCategoryMembershipMock).toHaveBeenCalledWith(['video-1'], 'created', true);
+        expect(wrapper.find('.category-dialog').exists()).toBe(false);
+        expect(document.activeElement).toBe(trigger.element);
+    });
+
+    it('keeps a created category and reports when automatic assignment fails', async () => {
+        wallStore.applySnapshot({
+            library: [media('video-1', [])],
+            categories: [],
+            settings: defaultSettings(),
+            playback: idlePlayback(),
+        });
+        createCategoryMock.mockResolvedValue({
+            ...wallStore.snapshot,
+            categories: [{ id: 'created', name: '动漫收藏' }],
+        });
+        setCategoryMembershipMock.mockRejectedValue(new Error('添加失败'));
+        const wrapper = await mountAppWithCategoryProbe();
+        const trigger = wrapper.get('[data-open-category-creator]');
+
+        await trigger.trigger('click');
+        await wrapper.get('.category-dialog input').setValue('动漫收藏');
+        await wrapper.get('.category-dialog form').trigger('submit');
+        await flushPromises();
+
+        expect(createCategoryMock).toHaveBeenCalledOnce();
+        expect(setCategoryMembershipMock).toHaveBeenCalledWith(['video-1'], 'created', true);
+        expect(wrapper.find('.category-dialog').exists()).toBe(false);
+        expect(wrapper.get('.error-toast').text()).toBe('分类已创建，但添加到当前壁纸失败，请重试');
+        expect(document.activeElement).toBe(trigger.element);
     });
 
     it('supports keyboard navigation and dismissal for the category menu', async () => {
@@ -345,6 +408,33 @@ async function mountApp() {
             { path: '/', name: 'library', component: { template: '<div />' } },
             { path: '/settings/:section', name: 'settings', component: { template: '<div />' } },
         ],
+    });
+    await router.push('/');
+    await router.isReady();
+    return mount(App, { attachTo: document.body, global: { plugins: [router] } });
+}
+
+const CategoryCreatorProbe = defineComponent({
+    setup() {
+        const openCategoryCreator = inject(openCategoryCreatorKey);
+        if (!openCategoryCreator) throw new Error('缺少分类创建入口');
+        return () =>
+            h(
+                'button',
+                {
+                    'data-open-category-creator': '',
+                    onClick: (event: MouseEvent) =>
+                        openCategoryCreator(['video-1'], event.currentTarget as HTMLElement),
+                },
+                '新建并添加',
+            );
+    },
+});
+
+async function mountAppWithCategoryProbe() {
+    const router = createRouter({
+        history: createMemoryHistory(),
+        routes: [{ path: '/', name: 'library', component: CategoryCreatorProbe }],
     });
     await router.push('/');
     await router.isReady();

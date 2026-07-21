@@ -1,9 +1,10 @@
-/** 验证壁纸库的空状态和媒体卡片是同一响应式数据源。 */
+/** 验证壁纸库的媒体操作、批量分类与管理流程。 */
 // @vitest-environment jsdom
 
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { openCategoryCreatorKey } from './categoryCreator';
 import { defaultSettings, wallStore } from './store';
 import LibraryView from './views/LibraryView.vue';
 
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
     setCategoryMembership: vi.fn(),
     setDisplayLayout: vi.fn(),
 }));
+const openCategoryCreatorMock = vi.fn();
 
 vi.mock('./api', () => ({
     importMedia: mocks.importMedia,
@@ -34,6 +36,7 @@ enableAutoUnmount(afterEach);
 describe('LibraryView', () => {
     beforeEach(() => {
         Object.values(mocks).forEach((mock) => mock.mockReset());
+        openCategoryCreatorMock.mockReset();
         wallStore.search = '';
         wallStore.filter = 'all';
         wallStore.activeCategoryId = null;
@@ -198,10 +201,37 @@ describe('LibraryView', () => {
         expect(wrapper.get('h1').text()).toBe('批量管理');
         await wrapper.get('.wallpaper-card').trigger('click');
         await wrapper.get('[data-batch-action="add"]').trigger('click');
+        const assigned = wrapper.get('[aria-label="已添加自然风景"]');
+        expect(assigned.attributes()).toHaveProperty('disabled');
+        expect(assigned.text()).toContain('✓');
         await wrapper.get('[aria-label="添加到城市夜景"]').trigger('click');
         await flushPromises();
 
         expect(mocks.setCategoryMembership).toHaveBeenCalledWith(['ocean'], 'city', true);
+    });
+
+    it('creates and assigns a category from the batch add menu when none exist', async () => {
+        wallStore.applySnapshot({
+            library: [media('ready', false)],
+            categories: [],
+            settings: defaultSettings(),
+            playback: idlePlayback(),
+        });
+        wallStore.enterBatchMode();
+        const wrapper = await mountLibrary();
+        await wrapper.get('.wallpaper-card').trigger('click');
+        const addTrigger = wrapper.get('[data-batch-action="add"]');
+        const removeTrigger = wrapper.get('[data-batch-action="remove"]');
+
+        expect(removeTrigger.attributes()).toHaveProperty('disabled');
+        await addTrigger.trigger('click');
+        expect(wrapper.get('.batch-category-menu .category-menu-empty').text()).toBe('还没有分类');
+        expect(wrapper.get('[data-batch-category-action="create"]').text()).toBe('新建并添加');
+
+        await wrapper.get('[data-batch-category-action="create"]').trigger('click');
+
+        expect(openCategoryCreatorMock).toHaveBeenCalledWith(['ready'], addTrigger.element);
+        expect(wrapper.find('.batch-category-menu').exists()).toBe(false);
     });
 
     it('hides card quick play for missing items and while batch management is active', async () => {
@@ -789,7 +819,13 @@ async function mountLibrary() {
     });
     await router.push('/');
     await router.isReady();
-    return mount(LibraryView, { attachTo: document.body, global: { plugins: [router] } });
+    return mount(LibraryView, {
+        attachTo: document.body,
+        global: {
+            plugins: [router],
+            provide: { [openCategoryCreatorKey as symbol]: openCategoryCreatorMock },
+        },
+    });
 }
 
 function media(id: string, missing: boolean) {

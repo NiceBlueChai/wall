@@ -1,6 +1,6 @@
 <!-- 展示本地壁纸库、筛选、导入和卡片快捷播放。 -->
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, inject, nextTick, onMounted, onUnmounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -14,6 +14,7 @@ import {
     setDisplayLayout,
 } from '../api';
 import { wallStore } from '../store';
+import { openCategoryCreatorKey } from '../categoryCreator';
 import WallIcon from '../components/WallIcon.vue';
 import type { DisplayMode, WallpaperItem } from '../types';
 
@@ -48,13 +49,16 @@ const batchRemovalCancel = ref<HTMLButtonElement | null>(null);
 const importDialog = ref<HTMLElement | null>(null);
 const cleanupDialog = ref<HTMLElement | null>(null);
 const batchRemovalDialog = ref<HTMLElement | null>(null);
+const openCategoryCreator = inject(openCategoryCreatorKey, () => undefined);
 let removalReturnFocus: HTMLElement | null = null;
 const library = computed(() => wallStore.filteredLibrary);
 const selectedItems = computed(() =>
     wallStore.snapshot.library.filter((item) => wallStore.selectedMediaIds.includes(item.id)),
 );
 const missingItems = computed(() => wallStore.snapshot.library.filter((item) => item.missing));
-const missingActiveCount = computed(() => missingItems.value.filter((item) => wallStore.isMediaActive(item.id)).length);
+const missingActiveCount = computed(() => {
+    return missingItems.value.filter((item) => wallStore.isMediaActive(item.id)).length;
+});
 const selectedActiveCount = computed(
     () => selectedItems.value.filter((item) => wallStore.isMediaActive(item.id)).length,
 );
@@ -160,6 +164,13 @@ async function changeCategory(categoryId: string, assigned: boolean) {
     } finally {
         batchCategoryBusy.value = false;
     }
+}
+
+function createAndAssignCategory() {
+    if (batchCategoryBusy.value || !wallStore.selectedMediaIds.length || !batchAddTrigger.value) return;
+    const mediaIds = [...wallStore.selectedMediaIds];
+    batchMenu.value = null;
+    openCategoryCreator(mediaIds, batchAddTrigger.value);
 }
 
 function exitBatchMode() {
@@ -493,13 +504,33 @@ function readError(error: unknown): string {
                             <button
                                 v-for="category in wallStore.snapshot.categories"
                                 :key="category.id"
-                                :aria-label="`添加到${category.name}`"
+                                :aria-label="
+                                    canChangeCategory(category.id, true)
+                                        ? `添加到${category.name}`
+                                        : `已添加${category.name}`
+                                "
                                 role="menuitem"
                                 :disabled="batchCategoryBusy || !canChangeCategory(category.id, true)"
                                 @click="changeCategory(category.id, true)"
                             >
                                 <span>{{ category.name }}</span>
-                                <small v-if="!canChangeCategory(category.id, true)">已包含</small>
+                                <span v-if="!canChangeCategory(category.id, true)" class="menu-check">✓</span>
+                            </button>
+                            <button
+                                v-if="!wallStore.snapshot.categories.length"
+                                class="category-menu-empty"
+                                role="menuitem"
+                                disabled
+                            >
+                                还没有分类
+                            </button>
+                            <button
+                                class="category-menu-create"
+                                data-batch-category-action="create"
+                                role="menuitem"
+                                @click="createAndAssignCategory"
+                            >
+                                {{ wallStore.snapshot.categories.length ? '新建分类' : '新建并添加' }}
                             </button>
                         </div>
                     </div>
@@ -510,7 +541,11 @@ function readError(error: unknown): string {
                             data-batch-action="remove"
                             aria-haspopup="menu"
                             :aria-expanded="batchMenu === 'remove'"
-                            :disabled="batchCategoryBusy || !wallStore.selectedMediaIds.length"
+                            :disabled="
+                                batchCategoryBusy ||
+                                !wallStore.selectedMediaIds.length ||
+                                !wallStore.snapshot.categories.length
+                            "
                             @click="setBatchMenu('remove')"
                             @keydown.down.prevent="openBatchMenuFromKeyboard('remove', false)"
                             @keydown.up.prevent="openBatchMenuFromKeyboard('remove', true)"
