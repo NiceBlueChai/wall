@@ -205,9 +205,8 @@ pub struct MpvPlayer {
     child: Option<Child>,
     pipe_name: Option<String>,
     player_window: Option<isize>,
+    shell_view: Option<isize>,
     screen_size: Option<(i32, i32)>,
-    order_stop: Option<Arc<AtomicBool>>,
-    order_thread: Option<JoinHandle<()>>,
 }
 
 impl MpvPlayer {
@@ -284,14 +283,10 @@ impl MpvPlayer {
             terminate_child(&mut child);
             return Err(error);
         }
-        if desktop.raised {
-            let (stop, handle) = maintain_window_order(player_window, desktop.shell_view);
-            self.order_stop = Some(stop);
-            self.order_thread = Some(handle);
-        }
         self.child = Some(child);
         self.pipe_name = Some(pipe_name);
         self.player_window = Some(player_window);
+        self.shell_view = desktop.raised.then_some(desktop.shell_view);
         self.screen_size = Some((screen_width, screen_height));
         Ok(())
     }
@@ -347,12 +342,6 @@ impl MpvPlayer {
 
     /// 停止当前 mpv 进程；管道不可用时直接终止子进程。
     pub fn stop(&mut self) {
-        if let Some(stop) = self.order_stop.take() {
-            stop.store(true, Ordering::Release);
-        }
-        if let Some(handle) = self.order_thread.take() {
-            let _ = handle.join();
-        }
         if self.child.is_some() {
             let _ = self.send(json!({ "command": ["quit"] }));
         }
@@ -366,6 +355,7 @@ impl MpvPlayer {
         self.child = None;
         self.pipe_name = None;
         self.player_window = None;
+        self.shell_view = None;
         self.screen_size = None;
     }
 
@@ -563,12 +553,38 @@ fn failed_switch_disposition(
 #[derive(Default)]
 pub struct MpvPlayerManager {
     groups: HashMap<String, PlayerGroup>,
+    order_stop: Option<Arc<AtomicBool>>,
+    order_thread: Option<JoinHandle<()>>,
 }
 
 impl MpvPlayerManager {
     /// 判断指定显示目标当前是否有受管播放器组。
     pub fn has_target(&self, target_id: &str) -> bool {
         self.groups.contains_key(target_id)
+    }
+
+    fn stop_window_order(&mut self) {
+        if let Some(stop) = self.order_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(thread) = self.order_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn refresh_window_order(&mut self) {
+        self.stop_window_order();
+        let targets = self
+            .groups
+            .values()
+            .flat_map(|group| &group.players)
+            .filter_map(|player| Some((player.player_window?, player.shell_view?)))
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            let (stop, thread) = maintain_window_order(targets);
+            self.order_stop = Some(stop);
+            self.order_thread = Some(thread);
+        }
     }
 
     /// 兼容单显示器调用，并停止此前全部播放器。
@@ -863,6 +879,9 @@ impl MpvPlayerManager {
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
+        if !replaced.is_empty() {
+            self.stop_window_order();
+        }
         for key in replaced {
             if let Some(mut group) = self.groups.remove(&key) {
                 for player in &mut group.players {
@@ -887,6 +906,7 @@ impl MpvPlayerManager {
                 players,
             },
         );
+        self.refresh_window_order();
         Ok(())
     }
 
@@ -1099,6 +1119,9 @@ impl MpvPlayerManager {
             .filter(|(_, group)| group.media_id == media_id)
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
+        if !keys.is_empty() {
+            self.stop_window_order();
+        }
         for key in keys {
             if let Some(mut group) = self.groups.remove(&key) {
                 for player in &mut group.players {
@@ -1106,19 +1129,25 @@ impl MpvPlayerManager {
                 }
             }
         }
+        self.refresh_window_order();
     }
 
     /// 停止并移除一个显示目标。
     pub fn stop_target(&mut self, target_id: &str) {
+        if self.groups.contains_key(target_id) {
+            self.stop_window_order();
+        }
         if let Some(mut group) = self.groups.remove(target_id) {
             for player in &mut group.players {
                 player.stop();
             }
         }
+        self.refresh_window_order();
     }
 
     /// 停止并清空全部显示目标。
     pub fn stop(&mut self) {
+        self.stop_window_order();
         for group in self.groups.values_mut() {
             for player in &mut group.players {
                 player.stop();
@@ -1332,15 +1361,33 @@ fn embed_player_window(
     Err(PlayerError::MissingDesktopHost)
 }
 
-fn maintain_window_order(
-    player_window: isize,
-    shell_view: isize,
-) -> (Arc<AtomicBool>, JoinHandle<()>) {
+fn window_order_chain(mut targets: Vec<(isize, isize)>) -> Vec<(isize, isize)> {
+    targets.sort_unstable_by_key(|(player, shell)| (*shell, *player));
+    let mut previous = None;
+    targets
+        .into_iter()
+        .map(|(player, shell)| {
+            let insert_after = match previous {
+                Some((previous_shell, previous_player)) if previous_shell == shell => {
+                    previous_player
+                }
+                _ => shell,
+            };
+            previous = Some((shell, player));
+            (player, insert_after)
+        })
+        .collect()
+}
+
+fn maintain_window_order(targets: Vec<(isize, isize)>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let chain = window_order_chain(targets);
     let handle = thread::spawn(move || {
         while !thread_stop.load(Ordering::Acquire) {
-            ensure_window_order(player_window, shell_view);
+            for &(player_window, insert_after) in &chain {
+                ensure_window_order(player_window, insert_after);
+            }
             thread::sleep(Duration::from_millis(250));
         }
     });
@@ -1348,7 +1395,7 @@ fn maintain_window_order(
 }
 
 #[cfg(windows)]
-fn ensure_window_order(player_window: isize, shell_view: isize) {
+fn ensure_window_order(player_window: isize, insert_after: isize) {
     use core::ffi::c_void;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1356,12 +1403,12 @@ fn ensure_window_order(player_window: isize, shell_view: isize) {
     };
 
     let player = HWND(player_window as *mut c_void);
-    let shell = HWND(shell_view as *mut c_void);
+    let anchor = HWND(insert_after as *mut c_void);
     unsafe {
-        if IsWindow(Some(player)).as_bool() && IsWindow(Some(shell)).as_bool() {
+        if IsWindow(Some(player)).as_bool() && IsWindow(Some(anchor)).as_bool() {
             let _ = SetWindowPos(
                 player,
-                Some(shell),
+                Some(anchor),
                 0,
                 0,
                 0,
@@ -1373,14 +1420,14 @@ fn ensure_window_order(player_window: isize, shell_view: isize) {
 }
 
 #[cfg(not(windows))]
-fn ensure_window_order(_player_window: isize, _shell_view: isize) {}
+fn ensure_window_order(_player_window: isize, _insert_after: isize) {}
 
 #[cfg(test)]
 mod tests {
     use super::{
         FailedSwitchDisposition, MpvPlayer, PlayerError, PlayerGroup, ScreenRegion, can_hot_switch,
         embedding_flags, failed_switch_disposition, ipc_request_id, loadfile_command,
-        validate_loadfile_response,
+        validate_loadfile_response, window_order_chain,
     };
     use crate::model::{AppSettings, DisplayMode, MediaKind};
     use serde_json::json;
@@ -1398,6 +1445,14 @@ mod tests {
         assert_eq!(raised_flags & SWP_NO_Z_ORDER, 0);
         assert_eq!(legacy_flags & SWP_FRAME_CHANGED, SWP_FRAME_CHANGED);
         assert_eq!(legacy_flags & SWP_NO_Z_ORDER, SWP_NO_Z_ORDER);
+    }
+
+    #[test]
+    fn multiple_windows_form_one_stable_desktop_chain() {
+        assert_eq!(
+            window_order_chain(vec![(30, 7), (20, 7)]),
+            vec![(20, 7), (30, 20)]
+        );
     }
 
     #[test]
