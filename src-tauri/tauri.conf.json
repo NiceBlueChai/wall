@@ -34,9 +34,16 @@
     "bundle": {
         "active": true,
         "targets": ["nsis"],
+        "icon": ["icons/icon.ico", "icons/icon.png"],
         "resources": {
             "binaries/mpv.exe": "mpv.exe",
             "binaries/d3dcompiler_43.dll": "d3dcompiler_43.dll"
+        },
+        "windows": {
+            "nsis": {
+                "installerIcon": "icons/icon.ico",
+                "uninstallerIcon": "icons/icon.ico"
+            }
         },
         "shortDescription": "完全离线的 Windows 动态壁纸工具"
     }

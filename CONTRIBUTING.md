@@ -47,9 +47,10 @@ cargo test --manifest-path src-tauri\Cargo.toml
 cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
 ```
 
-涉及桌面嵌入、托盘、开机启动或休眠检测时，还应在 Windows 10/11 实机验证。涉及发布包时运行：
+涉及桌面嵌入、托盘、开机启动或休眠检测时，还应在 Windows 10/11 实机验证。涉及发布包时分别运行：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-installer.ps1
 powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1
 ```
 
