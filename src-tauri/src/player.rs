@@ -5,6 +5,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -203,6 +205,8 @@ pub enum PlayerError {
 #[derive(Default)]
 pub struct MpvPlayer {
     child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<OwnedHandle>,
     pipe_name: Option<String>,
     player_window: Option<isize>,
     shell_view: Option<isize>,
@@ -272,6 +276,14 @@ impl MpvPlayer {
             command.creation_flags(0x08000000);
         }
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        let job = match assign_child_to_kill_job(&child) {
+            Ok(job) => job,
+            Err(problem) => {
+                terminate_child(&mut child);
+                return Err(problem);
+            }
+        };
         let player_window = match wait_for_player_window(&window_title, &mut child) {
             Ok(window) => window,
             Err(error) => {
@@ -284,6 +296,10 @@ impl MpvPlayer {
             return Err(error);
         }
         self.child = Some(child);
+        #[cfg(windows)]
+        {
+            self.job = Some(job);
+        }
         self.pipe_name = Some(pipe_name);
         self.player_window = Some(player_window);
         self.shell_view = desktop.raised.then_some(desktop.shell_view);
@@ -353,6 +369,10 @@ impl MpvPlayer {
             }
         }
         self.child = None;
+        #[cfg(windows)]
+        {
+            self.job = None;
+        }
         self.pipe_name = None;
         self.player_window = None;
         self.shell_view = None;
@@ -1168,6 +1188,40 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[cfg(windows)]
+fn assign_child_to_kill_job(child: &Child) -> Result<OwnedHandle, PlayerError> {
+    use core::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows::core::PCWSTR;
+
+    let raw_job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map_err(|problem| std::io::Error::other(problem.to_string()))?;
+    let job = unsafe { OwnedHandle::from_raw_handle(raw_job.0) };
+    let job_handle = HANDLE(job.as_raw_handle());
+    let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    unsafe {
+        SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            &information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|problem| std::io::Error::other(problem.to_string()))?;
+        AssignProcessToJobObject(job_handle, HANDLE(child.as_raw_handle()))
+            .map_err(|problem| std::io::Error::other(problem.to_string()))?;
+    }
+    Ok(job)
+}
+
 fn embedding_flags(raised_desktop: bool) -> u32 {
     const SWP_NO_Z_ORDER: u32 = 0x0004;
     const SWP_NO_ACTIVATE: u32 = 0x0010;
@@ -1429,12 +1483,50 @@ mod tests {
         embedding_flags, failed_switch_disposition, ipc_request_id, loadfile_command,
         validate_loadfile_response, window_order_chain,
     };
+    #[cfg(windows)]
+    use super::{assign_child_to_kill_job, terminate_child};
     use crate::model::{AppSettings, DisplayMode, MediaKind};
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    #[cfg(windows)]
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     const SWP_NO_Z_ORDER: u32 = 0x0004;
     const SWP_FRAME_CHANGED: u32 = 0x0020;
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_job_terminates_assigned_child() {
+        use std::os::windows::process::CommandExt as _;
+        use std::process::Command;
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .creation_flags(0x08000000);
+        let mut child = command.spawn().expect("测试子进程应能启动");
+        let job = assign_child_to_kill_job(&child).expect("子进程应能加入 Job Object");
+
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if child.try_wait().expect("应能读取测试子进程状态").is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        terminate_child(&mut child);
+        panic!("Job Object 关闭后测试子进程仍在运行");
+    }
 
     #[test]
     fn embedding_recreates_the_frame_and_preserves_the_expected_z_order() {
