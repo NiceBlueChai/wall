@@ -34,6 +34,10 @@
     "bundle": {
         "active": true,
         "targets": ["nsis"],
+        "resources": {
+            "binaries/mpv.exe": "mpv.exe",
+            "binaries/d3dcompiler_43.dll": "d3dcompiler_43.dll"
+        },
         "shortDescription": "完全离线的 Windows 动态壁纸工具"
     }
 }
